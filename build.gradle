@@ -1,0 +1,35 @@
+plugins {
+    id 'java-library'
+    id 'java-test-fixtures'
+    id 'net.ltgt.errorprone' version '5.1.0'
+}
+
+group = 'com.jhuanglululu'
+version = '0.1.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    errorprone 'com.google.errorprone:error_prone_core:2.50.0'
+    // The harness asserts inside its drive helpers, so JUnit is part of the fixture API.
+    testFixturesApi 'org.junit.jupiter:junit-jupiter:6.1.2'
+    testImplementation 'org.junit.jupiter:junit-jupiter:6.1.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:6.1.2'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs << '-Werror'
+}
