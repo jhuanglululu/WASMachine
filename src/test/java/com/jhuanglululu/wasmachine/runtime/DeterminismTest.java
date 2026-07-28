@@ -17,9 +17,8 @@ class DeterminismTest {
         List<String> logs = new ArrayList<>();
         MachineInstance inst = new MachineInstance(
                 Module.parse(RuntimeWasm.forkDeterminismModule()),
-                new MachineInstance.Config("det", "billboard", "_billboard_main",
-                        List.of(new MachineInstance.AbiCheck("_billboard_abi", 1, 2)),
-                        1 << 20, 0L),
+                new MachineInstance.Config("det", RuntimeWasm.ENGINE_MODULE, "_engine_main",
+                        List.of(SyncRun.ENGINE_ABI), 1 << 20, 0L),
                 (name, message) -> logs.add(message),
                 Map.of());
 

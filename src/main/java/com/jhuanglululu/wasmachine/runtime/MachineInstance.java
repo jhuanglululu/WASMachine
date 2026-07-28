@@ -21,8 +21,9 @@ import java.util.concurrent.ThreadLocalRandom;
  * (each an {@link ExecutionContext} with its own memory + {@link HostAllocator}, a wake
  * condition, and a spawn-order index), the {@link SyncTable}, the shared {@link MemoryBudget}
  * and the two random streams. It implements every engine-owned ABI import (realloc, fork, join,
- * kill, exit, sleep, log, fail, sync, random), registers the embedder's own import modules
- * next to them, and drives execution one game tick at a time via {@link #tick}.
+ * kill, exit, sleep, log, fail, sync, random and the {@link MathKernel}), registers the
+ * embedder's own import modules next to them, and drives execution one game tick at a time via
+ * {@link #tick}.
  *
  * <p><b>Scheduling.</b> Each tick, every due task runs (to its next blocking point) in
  * <em>spawn order</em>, sharing one instruction budget. A task blocks at {@code sleep}
@@ -59,6 +60,14 @@ import java.util.concurrent.ThreadLocalRandom;
  * <p>Not thread-safe: an instance is confined to one worker at a time.
  */
 public final class MachineInstance {
+
+    /**
+     * The version of the engine-owned ABI this build speaks: what a guest's {@code _engine_abi()}
+     * must return. Additive import growth (a new math kernel entry, say) does not bump it — an
+     * older guest simply never imports the new name; semantic changes do. Plugin modules version
+     * independently through their own handshake export.
+     */
+    public static final int ENGINE_ABI_VERSION = 1;
 
     /**
      * One load-time handshake: {@code export} is invoked with no arguments and must return an
@@ -545,6 +554,7 @@ public final class MachineInstance {
         });
         addSyncImports(m, engine);
         addRandomImports(m, engine);
+        MathKernel.addImports(m, engine);
         return m;
     }
 

@@ -10,11 +10,21 @@ import java.util.Map;
 /**
  * Hand-rolls the small WebAssembly modules the runtime tests need (LEB and section
  * framing written by hand, independent of the parser). Each module exports a
- * {@code __heap_base} global so {@link MachineInstance} can start.
+ * {@code __heap_base} global so {@link MachineInstance} can start, and their handshake
+ * export {@code _engine_abi} returns {@link MachineInstance#ENGINE_ABI_VERSION}.
  */
 public final class RuntimeWasm {
 
     private RuntimeWasm() {}
+
+    /**
+     * The engine's own import module. ABI 3 split the namespaces (see guest-abi.md) so the
+     * boundary is structural: the engine owns this one, a plugin owns its own.
+     */
+    public static final String ENGINE_MODULE = "engine";
+
+    /** The stand-in plugin module these fixtures use for imports the engine does not own. */
+    public static final String PLUGIN_MODULE = "billboard";
 
     public static final class Buf {
         private final ByteArrayOutputStream o = new ByteArrayOutputStream();
@@ -129,22 +139,22 @@ public final class RuntimeWasm {
     }
 
     /**
-     * A module whose {@code main} calls {@code billboard.fail("boom")}; {@code _billboard_abi}
-     * returns 1.
+     * A module whose {@code main} calls {@code engine.fail("boom")}; {@code _engine_abi}
+     * returns the engine ABI version.
      */
     public static byte[] failModule() {
         Buf types = new Buf().vec(2)
                 .raw(0x60, 0x02, 0x7F, 0x7F, 0x00)  // type0 (i32,i32)->()
                 .raw(0x60, 0x00, 0x01, 0x7F);        // type1 ()->(i32)
-        Buf imports = new Buf().vec(1).name("billboard").name("fail").raw(0x00).uleb(0);
+        Buf imports = new Buf().vec(1).name(ENGINE_MODULE).name("fail").raw(0x00).uleb(0);
         Buf funcs = new Buf().vec(2).uleb(1).uleb(1); // main type1, abi type1
         Buf memory = new Buf().vec(1).raw(0x00).uleb(1);
         Buf exports = new Buf().vec(3)
-                .name("_billboard_main").raw(0x00).uleb(1) // func 1
-                .name("_billboard_abi").raw(0x00).uleb(2)  // func 2
+                .name("_engine_main").raw(0x00).uleb(1) // func 1
+                .name("_engine_abi").raw(0x00).uleb(2)  // func 2
                 .name("__heap_base").raw(0x03).uleb(0);    // global 0
         Buf mainBody = new Buf().raw(0x41, 0x00, 0x41, 0x04, 0x10, 0x00, 0x41, 0x00, 0x0B);
-        Buf abiBody = new Buf().raw(0x41, 0x01, 0x0B);
+        Buf abiBody = new Buf().raw(0x41).sleb(MachineInstance.ENGINE_ABI_VERSION).raw(0x0B);
         Buf code = new Buf().vec(2).buf(codeBody(mainBody)).buf(codeBody(abiBody));
         Buf data = new Buf().vec(1).uleb(0).raw(0x41, 0x00, 0x0B).uleb(4).raw(0x62, 0x6F, 0x6F, 0x6D); // "boom"
         return module(section(1, types), section(2, imports), section(3, funcs),
@@ -152,28 +162,28 @@ public final class RuntimeWasm {
                 section(10, code), section(11, data));
     }
 
-    /** A module exporting {@code _billboard_main} but NOT {@code _billboard_abi}. */
+    /** A module exporting {@code _engine_main} but NOT {@code _engine_abi}. */
     public static byte[] missingAbiModule() {
         Buf types = new Buf().vec(1).raw(0x60, 0x00, 0x01, 0x7F); // ()->(i32)
         Buf funcs = new Buf().vec(1).uleb(0);
         Buf exports = new Buf().vec(2)
-                .name("_billboard_main").raw(0x00).uleb(0)
+                .name("_engine_main").raw(0x00).uleb(0)
                 .name("__heap_base").raw(0x03).uleb(0);
         Buf code = new Buf().vec(1).buf(codeBody(new Buf().raw(0x41, 0x00, 0x0B)));
         return module(section(1, types), section(3, funcs), heapBaseGlobal(1024),
                 section(7, exports), section(10, code));
     }
 
-    /** A module whose {@code main} spins forever; {@code _billboard_abi} returns 1. */
+    /** A module whose {@code main} spins forever; {@code _engine_abi} is the engine version. */
     public static byte[] infiniteLoopModule() {
         Buf types = new Buf().vec(1).raw(0x60, 0x00, 0x01, 0x7F); // ()->(i32)
         Buf funcs = new Buf().vec(2).uleb(0).uleb(0);
         Buf exports = new Buf().vec(3)
-                .name("_billboard_main").raw(0x00).uleb(0)
-                .name("_billboard_abi").raw(0x00).uleb(1)
+                .name("_engine_main").raw(0x00).uleb(0)
+                .name("_engine_abi").raw(0x00).uleb(1)
                 .name("__heap_base").raw(0x03).uleb(0);
         Buf mainBody = new Buf().raw(0x03, 0x40, 0x0C, 0x00, 0x0B, 0x41, 0x00, 0x0B); // loop { br 0 } (unreachable const)
-        Buf abiBody = new Buf().raw(0x41, 0x01, 0x0B);
+        Buf abiBody = new Buf().raw(0x41).sleb(MachineInstance.ENGINE_ABI_VERSION).raw(0x0B);
         Buf code = new Buf().vec(2).buf(codeBody(mainBody)).buf(codeBody(abiBody));
         return module(section(1, types), section(3, funcs), heapBaseGlobal(1024),
                 section(7, exports), section(10, code));
@@ -191,16 +201,16 @@ public final class RuntimeWasm {
                 .raw(0x60, 0x00, 0x00)             // type3 exit ()->()
                 .raw(0x60, 0x01, 0x7F, 0x00);      // type4 join (i32)->()
         Buf imports = new Buf().vec(5)
-                .name("billboard").name("log").raw(0x00).uleb(0)
-                .name("billboard").name("fork").raw(0x00).uleb(1)
-                .name("billboard").name("sleep").raw(0x00).uleb(2)
-                .name("billboard").name("exit").raw(0x00).uleb(3)
-                .name("billboard").name("join").raw(0x00).uleb(4);
+                .name(ENGINE_MODULE).name("log").raw(0x00).uleb(0)
+                .name(ENGINE_MODULE).name("fork").raw(0x00).uleb(1)
+                .name(ENGINE_MODULE).name("sleep").raw(0x00).uleb(2)
+                .name(ENGINE_MODULE).name("exit").raw(0x00).uleb(3)
+                .name(ENGINE_MODULE).name("join").raw(0x00).uleb(4);
         Buf funcs = new Buf().vec(2).uleb(1).uleb(1); // main type1, abi type1 (func 5, 6)
         Buf memory = new Buf().vec(1).raw(0x00).uleb(1);
         Buf exports = new Buf().vec(3)
-                .name("_billboard_main").raw(0x00).uleb(5)
-                .name("_billboard_abi").raw(0x00).uleb(6)
+                .name("_engine_main").raw(0x00).uleb(5)
+                .name("_engine_abi").raw(0x00).uleb(6)
                 .name("__heap_base").raw(0x03).uleb(0);
         Buf mainInstr = new Buf()
                 .raw(0x10, 0x01)             // call fork
@@ -217,7 +227,8 @@ public final class RuntimeWasm {
                 .raw(0x41, 0x00);            // i32.const 0 (return)
         Buf mainBody = codeBodyWithLocals(new Buf().vec(1).uleb(1).raw(0x7F),
                 new Buf().buf(mainInstr).raw(0x0B));
-        Buf abiBody = codeBody(new Buf().raw(0x41, 0x01, 0x0B));
+        Buf abiBody = codeBody(new Buf().raw(0x41).sleb(MachineInstance.ENGINE_ABI_VERSION)
+                .raw(0x0B));
         Buf code = new Buf().vec(2).buf(mainBody).buf(abiBody);
         Buf data = new Buf().vec(1).uleb(0).raw(0x41, 0x00, 0x0B).uleb(2).raw(0x50, 0x43); // "PC"
         return module(section(1, types), section(2, imports), section(3, funcs),

@@ -19,10 +19,14 @@ public final class SyncRun {
 
     private SyncRun() {}
 
-    /** The instance name and handshake every fixture run uses. */
+    /** The instance name and handshake every fixture run uses (the ABI 3 engine names). */
     private static final String NAME = "sync";
-    private static final String ENTRY = "_billboard_main";
-    private static final String ABI = "_billboard_abi";
+    private static final String ENTRY = "_engine_main";
+    private static final String ABI = "_engine_abi";
+
+    /** The engine handshake every fixture module satisfies. */
+    public static final MachineInstance.AbiCheck ENGINE_ABI = new MachineInstance.AbiCheck(
+            ABI, MachineInstance.ENGINE_ABI_VERSION, MachineInstance.ENGINE_ABI_VERSION);
 
     /** How a run ended, independent of whose {@code TickResult} type reported it. */
     public record Outcome(boolean finished, String message) {
@@ -57,8 +61,8 @@ public final class SyncRun {
     public static Result run(SyncWasm.P main, long memoryCap, long seed, int maxTicks, long budget) {
         List<String> logs = new ArrayList<>();
         MachineInstance instance = new MachineInstance(Module.parse(SyncWasm.module(main)),
-                new MachineInstance.Config(NAME, SyncWasm.MODULE, ENTRY,
-                        List.of(new MachineInstance.AbiCheck(ABI, 1, 2)), memoryCap, seed),
+                new MachineInstance.Config(NAME, RuntimeWasm.ENGINE_MODULE, ENTRY,
+                        List.of(ENGINE_ABI), memoryCap, seed),
                 (name, message) -> logs.add(message), SyncWasm.stubPluginImports());
         return drive((tick, fuel) -> outcomeOf(instance.tick(tick, fuel)), logs, maxTicks, budget);
     }

@@ -18,9 +18,15 @@ import org.junit.jupiter.api.Test;
 class ErrorPathsTest {
 
     private static MachineInstance instance(byte[] moduleBytes, long cap) {
+        return instance(moduleBytes, cap, SyncRun.ENGINE_ABI);
+    }
+
+    /** An instance whose handshake expectation the test chooses, to pin the range check. */
+    private static MachineInstance instance(byte[] moduleBytes, long cap,
+            MachineInstance.AbiCheck check) {
         return new MachineInstance(Module.parse(moduleBytes),
-                new MachineInstance.Config("err", "billboard", "_billboard_main",
-                        List.of(new MachineInstance.AbiCheck("_billboard_abi", 1, 2)), cap, 0L),
+                new MachineInstance.Config("err", RuntimeWasm.ENGINE_MODULE, "_engine_main",
+                        List.of(check), cap, 0L),
                 (name, message) -> { }, SyncWasm.stubPluginImports());
     }
 
@@ -70,15 +76,27 @@ class ErrorPathsTest {
         // The check names the export, what it returned and what this host accepts.
         MachineInstance inst = instance(SyncWasm.module(new P(), 3), 1 << 20);
         String message = inst.loadError().orElseThrow();
-        assertTrue(message.contains("_billboard_abi") && message.contains("returned 3")
-                && message.contains("1..2"), message);
+        assertTrue(message.contains("_engine_abi") && message.contains("returned 3")
+                && message.contains("1..1"), message);
         assertErroredContains(inst.tick(0, 1_000_000), "handshake");
     }
 
     @Test
     void handshakeInsideTheRangeLoadsCleanly() {
-        assertEquals(true, instance(SyncWasm.module(new P(), 1), 1 << 20).loadError().isEmpty());
-        assertEquals(true, instance(SyncWasm.module(new P(), 2), 1 << 20).loadError().isEmpty());
+        // The engine speaks exactly one version today, but the check is a range: a host
+        // accepting 2..4 takes a guest reporting 3 and refuses one reporting 1.
+        assertEquals(true, instance(SyncWasm.module(new P()), 1 << 20).loadError().isEmpty());
+        MachineInstance.AbiCheck wide = new MachineInstance.AbiCheck("_engine_abi", 2, 4);
+        assertEquals(true,
+                instance(SyncWasm.module(new P(), 3), 1 << 20, wide).loadError().isEmpty());
+        assertTrue(instance(SyncWasm.module(new P(), 1), 1 << 20, wide)
+                .loadError().orElseThrow().contains("2..4"));
+    }
+
+    @Test
+    void theEngineHandshakeVersionIsWhatTheFixturesReport() {
+        // One constant, referenced by the fixtures and by every future embedder.
+        assertEquals(1, MachineInstance.ENGINE_ABI_VERSION);
     }
 
     @Test

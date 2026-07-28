@@ -7,15 +7,20 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Hand-rolled WebAssembly modules for the ABI v2 sync and random imports. Like
+ * Hand-rolled WebAssembly modules for the engine imports — tasks, sync, random and the math
+ * kernel — plus the plugin-owned entity and effect names an embedder supplies. Like
  * {@link RuntimeWasm} it writes section framing by hand, so the tests exercise the real
  * interpreter and the real host-import path rather than a stand-in for them.
  *
  * <p>Every module has the same shape: one import table (indices are the {@code *} constants
  * below), a 1-page memory whose first 26 bytes are {@code "ABC…Z"} (so {@code log(i, 1)}
  * prints the {@code i}-th letter and {@code channel_send(ch, i, 1)} sends it), scratch space
- * from byte 64 up, and a {@code _billboard_main} body supplied by the test through {@link P}.
- * {@code _billboard_abi} returns 2.
+ * from byte 64 up, and a {@code _engine_main} body supplied by the test through {@link P}.
+ * {@code _engine_abi} returns {@link MachineInstance#ENGINE_ABI_VERSION}.
+ *
+ * <p>Imports are declared against two modules, as ABI 3 requires: the engine's own names under
+ * {@value RuntimeWasm#ENGINE_MODULE} and the plugin-owned entity/effect names under
+ * {@value RuntimeWasm#PLUGIN_MODULE}.
  */
 public final class SyncWasm {
 
@@ -92,8 +97,21 @@ public final class SyncWasm {
     public static final int GET_BLOCK_LEN = 66;
     public static final int GET_BLOCK = 67;
     public static final int REALLOC = 68;
+    // The engine math kernel (guest-abi.md); appended last so every index above is unchanged.
+    public static final int CBRT = 69;
+    public static final int POW = 70;
+    public static final int EXP = 71;
+    public static final int LN = 72;
+    public static final int LOG10 = 73;
+    public static final int SIN = 74;
+    public static final int COS = 75;
+    public static final int TAN = 76;
+    public static final int ASIN = 77;
+    public static final int ACOS = 78;
+    public static final int ATAN2 = 79;
+    public static final int FORMAT_F64 = 80;
 
-    private static final int IMPORT_COUNT = 69;
+    private static final int IMPORT_COUNT = 81;
 
     /** Scratch address for received channel payloads (well clear of the letter table). */
     public static final int SCRATCH = 64;
@@ -231,14 +249,14 @@ public final class SyncWasm {
         }
     }
 
-    /** Wraps {@code main} into a complete module whose {@code _billboard_abi} returns 2. */
+    /** Wraps {@code main} into a complete module reporting the current engine ABI version. */
     public static byte[] module(P main) {
-        return module(main, 2);
+        return module(main, MachineInstance.ENGINE_ABI_VERSION);
     }
 
     /** Wraps {@code main} into a complete module reporting ABI version {@code abiVersion}. */
     public static byte[] module(P main, int abiVersion) {
-        Buf types = new Buf().vec(24)
+        Buf types = new Buf().vec(27)
                 .raw(0x60, 0x02, 0x7F, 0x7F, 0x00)       // 0 (i32,i32)->()
                 .raw(0x60, 0x00, 0x01, 0x7F)             // 1 ()->(i32)
                 .raw(0x60, 0x01, 0x7E, 0x00)             // 2 (i64)->()
@@ -274,7 +292,11 @@ public final class SyncWasm {
                 // 22 (i32,f64,f64,f64,f64,i64)->() — set_rotation
                 .raw(0x60, 0x06, 0x7F, 0x7C, 0x7C, 0x7C, 0x7C, 0x7E, 0x00)
                 // 23 (i32,i32,i32,i32)->(i32) — realloc
-                .raw(0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F);
+                .raw(0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F)
+                .raw(0x60, 0x01, 0x7C, 0x01, 0x7C)             // 24 (f64)->(f64) — unary math
+                .raw(0x60, 0x02, 0x7C, 0x7C, 0x01, 0x7C)       // 25 (f64,f64)->(f64) — pow, atan2
+                // 26 (f64,i32,i32,i32)->(i32) — format_f64
+                .raw(0x60, 0x04, 0x7C, 0x7F, 0x7F, 0x7F, 0x01, 0x7F);
 
         Buf imports = new Buf().vec(IMPORT_COUNT);
         imp(imports, "log", 0);
@@ -346,14 +368,26 @@ public final class SyncWasm {
         imp(imports, "get_block_len", 5);
         imp(imports, "get_block", 0);
         imp(imports, "realloc", 23);
+        imp(imports, "cbrt", 24);
+        imp(imports, "pow", 25);
+        imp(imports, "exp", 24);
+        imp(imports, "ln", 24);
+        imp(imports, "log10", 24);
+        imp(imports, "sin", 24);
+        imp(imports, "cos", 24);
+        imp(imports, "tan", 24);
+        imp(imports, "asin", 24);
+        imp(imports, "acos", 24);
+        imp(imports, "atan2", 25);
+        imp(imports, "format_f64", 26);
 
         Buf funcs = new Buf().vec(2).uleb(1).uleb(1); // main, abi (both ()->(i32))
         Buf memory = new Buf().vec(1).raw(0x00).uleb(1);
         Buf globals = RuntimeWasm.section(6,
                 new Buf().vec(1).raw(0x7F, 0x00).raw(0x41).sleb(1024).raw(0x0B));
         Buf exports = new Buf().vec(3)
-                .name("_billboard_main").raw(0x00).uleb(IMPORT_COUNT)
-                .name("_billboard_abi").raw(0x00).uleb(IMPORT_COUNT + 1)
+                .name("_engine_main").raw(0x00).uleb(IMPORT_COUNT)
+                .name("_engine_abi").raw(0x00).uleb(IMPORT_COUNT + 1)
                 .name("__heap_base").raw(0x03).uleb(0);
         Buf locals = new Buf().vec(2).uleb(8).raw(0x7F).uleb(2).raw(0x7E);
         Buf mainBody = body(locals, new Buf().buf(main.b).raw(0x41, 0x00, 0x0B));
@@ -372,15 +406,16 @@ public final class SyncWasm {
                 RuntimeWasm.section(11, data));
     }
 
-    private static void imp(Buf imports, String name, int typeIndex) {
-        imports.name(MODULE).name(name).raw(0x00).uleb(typeIndex);
-    }
-
     /**
-     * The import module every emitted module declares against. ABI 2 has a single namespace,
-     * so the engine's own imports and the embedder's share it.
+     * Emits one import, routed to its owner's module: ABI 3 splits the namespaces, so the
+     * declared module name is not a property of the emitter but of who implements the name.
      */
-    public static final String MODULE = "billboard";
+    private static void imp(Buf imports, String name, int typeIndex) {
+        String module = PLUGIN_IMPORTS.contains(name)
+                ? RuntimeWasm.PLUGIN_MODULE
+                : RuntimeWasm.ENGINE_MODULE;
+        imports.name(module).name(name).raw(0x00).uleb(typeIndex);
+    }
 
     /**
      * The imports above that the <em>engine</em> does not own — Billboard's entity and effect
@@ -410,7 +445,7 @@ public final class SyncWasm {
         for (String name : PLUGIN_IMPORTS) {
             functions.put(name, (ctx, args) -> 0L);
         }
-        return Map.of(MODULE, functions);
+        return Map.of(RuntimeWasm.PLUGIN_MODULE, functions);
     }
 
     private static Buf body(Buf localsDecl, Buf instructions) {
