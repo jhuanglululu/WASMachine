@@ -349,6 +349,31 @@ public final class ExecutionContext {
 
     // --- operand stack primitives ---
 
+    /**
+     * Sanity ceiling for the operand stack, enforced by assertion only. Real modules never come
+     * close (rustc emits shallow expression stacks); a hand-built module that pushes without
+     * popping would otherwise double the array until it exhausts the heap.
+     */
+    private static final int MAX_STACK_SLOTS = 1 << 20;
+
+    /**
+     * Every frame shares one operand-stack array, so popping below the current frame's
+     * {@code stackBase} silently reads the <em>caller's</em> slots instead of failing. There is
+     * deliberately no wasm operand-type validator (the only input is rustc output, and host
+     * safety is contained by bounds checks, caps and fuel), which leaves hand-built test modules
+     * with a wrong stack depth as the real hazard. These assertions are live wherever such
+     * modules exist — Gradle test JVMs run with {@code -ea} — and cost nothing in production.
+     */
+    private boolean canPop(int n) {
+        return frameSp == 0 || sp - n >= frames[frameSp - 1].stackBase;
+    }
+
+    /** Drops {@code n} operand slots (the raw form of a pop whose value is unused). */
+    private void dropSlots(int n) {
+        assert canPop(n) : "operand stack underflow: pop of " + n + " below the frame base";
+        sp -= n;
+    }
+
     private void ensureStack() {
         if (sp == stack.length) {
             stack = Arrays.copyOf(stack, stack.length * 2);
@@ -356,11 +381,13 @@ public final class ExecutionContext {
     }
 
     private void push(long v) {
+        assert sp < MAX_STACK_SLOTS : "operand stack overflow past " + MAX_STACK_SLOTS + " slots";
         ensureStack();
         stack[sp++] = v;
     }
 
     private long pop() {
+        assert canPop(1) : "operand stack underflow: pop below the frame base";
         return stack[--sp];
     }
 
@@ -369,6 +396,7 @@ public final class ExecutionContext {
     }
 
     private int popI32() {
+        assert canPop(1) : "operand stack underflow: pop below the frame base";
         return (int) stack[--sp];
     }
 
@@ -377,6 +405,7 @@ public final class ExecutionContext {
     }
 
     private long popI64() {
+        assert canPop(1) : "operand stack underflow: pop below the frame base";
         return stack[--sp];
     }
 
@@ -385,6 +414,7 @@ public final class ExecutionContext {
     }
 
     private float popF32() {
+        assert canPop(1) : "operand stack underflow: pop below the frame base";
         return Float.intBitsToFloat((int) stack[--sp]);
     }
 
@@ -393,7 +423,14 @@ public final class ExecutionContext {
     }
 
     private double popF64() {
+        assert canPop(1) : "operand stack underflow: pop below the frame base";
         return Double.longBitsToDouble(stack[--sp]);
+    }
+
+    /** Peeks the top slot without popping (bulk ops price themselves off it before consuming). */
+    private long peek() {
+        assert canPop(1) : "operand stack underflow: peek below the frame base";
+        return stack[sp - 1];
     }
 
     // --- little-endian memory access ---
@@ -591,6 +628,7 @@ public final class ExecutionContext {
                 case 0x0F -> {   // return
                     int keep = f.resultArity;
                     int base = f.labels[0];
+                    assert sp - keep >= base : "return: fewer results on the stack than declared";
                     System.arraycopy(stack, sp - keep, stack, base, keep);
                     sp = base + keep;
                     f.labelSp = 0;
@@ -632,7 +670,7 @@ public final class ExecutionContext {
                     f = frames[frameSp - 1];
                     body = f.body;
                 }
-                case 0x1A -> sp--;        // drop
+                case 0x1A -> dropSlots(1);  // drop
                 case 0x1B -> {            // select
                     int c = popI32();
                     long b = pop();
@@ -650,7 +688,7 @@ public final class ExecutionContext {
                 case 0x20 -> push(f.locals[readVarU32(f)]);          // local.get
                 case 0x21 -> f.locals[readVarU32(f)] = pop();        // local.set
                 case 0x22 -> {                                       // local.tee
-                    long v = stack[sp - 1];
+                    long v = peek();
                     f.locals[readVarU32(f)] = v;
                 }
                 case 0x23 -> push(globals[readVarU32(f)]);           // global.get
@@ -700,15 +738,15 @@ public final class ExecutionContext {
                 case 0x3F -> { readVarU32(f); pushI32(memPages); }   // memory.size
                 case 0x40 -> {                                       // memory.grow
                     readVarU32(f);
-                    long d = stack[sp - 1] & 0xFFFFFFFFL; // peek delta; don't pop until affordable
+                    long d = peek() & 0xFFFFFFFFL; // peek delta; don't pop until affordable
                     long np = memPages + d;
                     if (np > memMaxPages) {
-                        sp--;
+                        dropSlots(1);
                         pushI32(-1); // failure is cheap: no allocation
                     } else if (!afford(1 + d * (PAGE >>> 4), pc, f)) {
                         return new ExecResult.FuelExhausted();
                     } else {
-                        sp--;
+                        dropSlots(1);
                         int old = memPages;
                         growMemoryUnchecked((int) np);
                         pushI32(old);
@@ -952,6 +990,7 @@ public final class ExecutionContext {
         int targetPc = f.labels[lb + 1];
         int keep = f.labels[lb + 2];
         int endPc = f.labels[lb + 3];
+        assert sp - keep >= base : "branch: fewer kept operands on the stack than the label wants";
         System.arraycopy(stack, sp - keep, stack, base, keep);
         sp = base + keep;
         if (targetPc != endPc) { // loop back-edge
@@ -999,6 +1038,8 @@ public final class ExecutionContext {
         frameSp--;
         if (frameSp == 0) {
             long[] res = new long[done.resultArity];
+            assert sp >= done.stackBase + done.resultArity
+                    : "return: the entry frame left fewer results than it declares";
             System.arraycopy(stack, done.stackBase, res, 0, done.resultArity);
             sp = done.stackBase;
             status = Status.COMPLETED;
@@ -1016,6 +1057,7 @@ public final class ExecutionContext {
         int np = type.params().size();
         if (fi < importedCount) {
             long[] args = new long[np];
+            assert canPop(np) : "call: fewer than " + np + " argument(s) above the frame base";
             System.arraycopy(stack, sp - np, args, 0, np);
             sp -= np;
             HostFunction hf = instance.hostFunction(fi);
@@ -1037,6 +1079,7 @@ public final class ExecutionContext {
         }
         FunctionCode code = module.code().get(fi - importedCount);
         Frame nf = newFrame(fi, type, code);
+        assert canPop(np) : "call: fewer than " + np + " argument(s) above the frame base";
         System.arraycopy(stack, sp - np, nf.locals, 0, np);
         sp -= np;
         nf.stackBase = sp;
@@ -1072,11 +1115,11 @@ public final class ExecutionContext {
             case 8 -> { // memory.init dataidx memidx
                 int dataIdx = readVarU32(f);
                 readVarU32(f); // memidx (0)
-                long len = stack[sp - 1] & 0xFFFFFFFFL; // peek
+                long len = peek() & 0xFFFFFFFFL; // peek
                 if (!afford(1 + (len >>> BULK_UNIT_SHIFT), opPc, f)) {
                     return new ExecResult.FuelExhausted();
                 }
-                sp--; // consume len
+                dropSlots(1); // consume len
                 long src = popI32() & 0xFFFFFFFFL;
                 long dst = popI32() & 0xFFFFFFFFL;
                 byte[] seg = dataDropped[dataIdx] ? EMPTY : instance.dataSegment(dataIdx);
@@ -1089,11 +1132,11 @@ public final class ExecutionContext {
             case 10 -> { // memory.copy
                 readVarU32(f);
                 readVarU32(f);
-                long len = stack[sp - 1] & 0xFFFFFFFFL; // peek
+                long len = peek() & 0xFFFFFFFFL; // peek
                 if (!afford(1 + (len >>> BULK_UNIT_SHIFT), opPc, f)) {
                     return new ExecResult.FuelExhausted();
                 }
-                sp--;
+                dropSlots(1);
                 long src = popI32() & 0xFFFFFFFFL;
                 long dst = popI32() & 0xFFFFFFFFL;
                 long size = (long) memPages * PAGE;
@@ -1104,11 +1147,11 @@ public final class ExecutionContext {
             }
             case 11 -> { // memory.fill
                 readVarU32(f);
-                long len = stack[sp - 1] & 0xFFFFFFFFL; // peek
+                long len = peek() & 0xFFFFFFFFL; // peek
                 if (!afford(1 + (len >>> BULK_UNIT_SHIFT), opPc, f)) {
                     return new ExecResult.FuelExhausted();
                 }
-                sp--;
+                dropSlots(1);
                 byte val = (byte) popI32();
                 long dst = popI32() & 0xFFFFFFFFL;
                 if (dst + len > (long) memPages * PAGE) {
@@ -1119,11 +1162,11 @@ public final class ExecutionContext {
             case 12 -> { // table.init elemidx tableidx
                 int elemIdx = readVarU32(f);
                 int[] table = tables[readVarU32(f)];
-                long len = stack[sp - 1] & 0xFFFFFFFFL; // peek
+                long len = peek() & 0xFFFFFFFFL; // peek
                 if (!afford(1 + (len >>> BULK_UNIT_SHIFT), opPc, f)) {
                     return new ExecResult.FuelExhausted();
                 }
-                sp--;
+                dropSlots(1);
                 long src = popI32() & 0xFFFFFFFFL;
                 long dst = popI32() & 0xFFFFFFFFL;
                 int[] seg = elemDropped[elemIdx] ? EMPTY_INT : instance.elementSegment(elemIdx);
@@ -1136,11 +1179,11 @@ public final class ExecutionContext {
             case 14 -> { // table.copy dst src
                 int[] dstTable = tables[readVarU32(f)];
                 int[] srcTable = tables[readVarU32(f)];
-                long len = stack[sp - 1] & 0xFFFFFFFFL; // peek
+                long len = peek() & 0xFFFFFFFFL; // peek
                 if (!afford(1 + (len >>> BULK_UNIT_SHIFT), opPc, f)) {
                     return new ExecResult.FuelExhausted();
                 }
-                sp--;
+                dropSlots(1);
                 long src = popI32() & 0xFFFFFFFFL;
                 long dst = popI32() & 0xFFFFFFFFL;
                 if (src + len > srcTable.length || dst + len > dstTable.length) {
@@ -1151,15 +1194,15 @@ public final class ExecutionContext {
             case 15 -> { // table.grow
                 int ti = readVarU32(f);
                 int[] table = tables[ti];
-                long delta = stack[sp - 1] & 0xFFFFFFFFL; // peek delta (initVal is below it)
+                long delta = peek() & 0xFFFFFFFFL; // peek delta (initVal is below it)
                 long np = (table.length & 0xFFFFFFFFL) + delta;
                 if (np > tableMax[ti]) {
-                    sp -= 2; // pop delta + initVal
+                    dropSlots(2); // pop delta + initVal
                     pushI32(-1); // failure is cheap: no allocation
                 } else if (!afford(1 + (np >>> BULK_UNIT_SHIFT), opPc, f)) {
                     return new ExecResult.FuelExhausted();
                 } else {
-                    sp--; // consume delta
+                    dropSlots(1); // consume delta
                     int initVal = popI32();
                     int old = table.length;
                     int[] nt = Arrays.copyOf(table, (int) np);
@@ -1171,11 +1214,11 @@ public final class ExecutionContext {
             case 16 -> pushI32(tables[readVarU32(f)].length); // table.size
             case 17 -> { // table.fill
                 int[] table = tables[readVarU32(f)];
-                long len = stack[sp - 1] & 0xFFFFFFFFL; // peek
+                long len = peek() & 0xFFFFFFFFL; // peek
                 if (!afford(1 + (len >>> BULK_UNIT_SHIFT), opPc, f)) {
                     return new ExecResult.FuelExhausted();
                 }
-                sp--;
+                dropSlots(1);
                 int val = popI32();
                 long dst = popI32() & 0xFFFFFFFFL;
                 if (dst + len > table.length) {
