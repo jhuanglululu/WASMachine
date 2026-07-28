@@ -71,7 +71,16 @@ class MathKernelTest {
                 Arguments.of(Double.NaN, 3, "NaN"),
                 Arguments.of(Double.POSITIVE_INFINITY, -1, "inf"),
                 Arguments.of(Double.NEGATIVE_INFINITY, 0, "-inf"),
-                Arguments.of(0.3, 17, "0.29999999999999999"));
+                Arguments.of(0.3, 17, "0.29999999999999999"),
+                // 2.675 is really 2.67499…, so half-up would say "2.68" and disagree with Rust.
+                Arguments.of(2.675, 2, "2.67"),
+                Arguments.of(0.0, 2, "0.00"),
+                Arguments.of(-1.0, 2, "-1.00"),
+                Arguments.of(12345.6789, -1, "12345.6789"),
+                Arguments.of(100.0, -1, "100"),
+                // The mirror of the 1e300 case, and one character longer: "0." + 300 decimals.
+                Arguments.of(1e-300, -1, "0." + "0".repeat(299) + "1"),
+                Arguments.of(1.0, 17, "1.00000000000000000"));
     }
 
     @ParameterizedTest(name = "format_f64({0}, {1})")

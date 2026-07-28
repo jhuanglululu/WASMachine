@@ -16,7 +16,8 @@ import java.util.Map;
  * below), a 1-page memory whose first 26 bytes are {@code "ABC…Z"} (so {@code log(i, 1)}
  * prints the {@code i}-th letter and {@code channel_send(ch, i, 1)} sends it), scratch space
  * from byte 64 up, and a {@code _engine_main} body supplied by the test through {@link P}.
- * {@code _engine_abi} returns {@link MachineInstance#ENGINE_ABI_VERSION}.
+ * {@code _engine_abi} returns {@link MachineInstance#ENGINE_ABI_VERSION} and the plugin
+ * handshake {@value #PLUGIN_ABI_EXPORT} returns {@value #PLUGIN_ABI_VERSION}.
  *
  * <p>Imports are declared against two modules, as ABI 3 requires: the engine's own names under
  * {@value RuntimeWasm#ENGINE_MODULE} and the plugin-owned entity/effect names under
@@ -249,13 +250,28 @@ public final class SyncWasm {
         }
     }
 
-    /** Wraps {@code main} into a complete module reporting the current engine ABI version. */
+    /**
+     * The plugin handshake version these modules report. The fixture stands in for a whole
+     * embedder — it already declares the plugin's imports — so it exports the plugin's
+     * handshake beside the engine's, which is what an embedder's own load check reads.
+     */
+    public static final int PLUGIN_ABI_VERSION = 3;
+
+    /** The plugin handshake export, named for the embedder these fixtures stand in for. */
+    public static final String PLUGIN_ABI_EXPORT = "_billboard_abi";
+
+    /** Wraps {@code main} into a complete module reporting both current ABI versions. */
     public static byte[] module(P main) {
         return module(main, MachineInstance.ENGINE_ABI_VERSION);
     }
 
-    /** Wraps {@code main} into a complete module reporting ABI version {@code abiVersion}. */
+    /** Wraps {@code main} into a module reporting engine version {@code abiVersion}. */
     public static byte[] module(P main, int abiVersion) {
+        return module(main, abiVersion, PLUGIN_ABI_VERSION);
+    }
+
+    /** Wraps {@code main} into a module reporting each handshake version explicitly. */
+    public static byte[] module(P main, int abiVersion, int pluginAbiVersion) {
         Buf types = new Buf().vec(27)
                 .raw(0x60, 0x02, 0x7F, 0x7F, 0x00)       // 0 (i32,i32)->()
                 .raw(0x60, 0x00, 0x01, 0x7F)             // 1 ()->(i32)
@@ -381,18 +397,22 @@ public final class SyncWasm {
         imp(imports, "atan2", 25);
         imp(imports, "format_f64", 26);
 
-        Buf funcs = new Buf().vec(2).uleb(1).uleb(1); // main, abi (both ()->(i32))
+        // main, the engine handshake and the plugin handshake — all ()->(i32).
+        Buf funcs = new Buf().vec(3).uleb(1).uleb(1).uleb(1);
         Buf memory = new Buf().vec(1).raw(0x00).uleb(1);
         Buf globals = RuntimeWasm.section(6,
                 new Buf().vec(1).raw(0x7F, 0x00).raw(0x41).sleb(1024).raw(0x0B));
-        Buf exports = new Buf().vec(3)
+        Buf exports = new Buf().vec(4)
                 .name("_engine_main").raw(0x00).uleb(IMPORT_COUNT)
                 .name("_engine_abi").raw(0x00).uleb(IMPORT_COUNT + 1)
+                .name(PLUGIN_ABI_EXPORT).raw(0x00).uleb(IMPORT_COUNT + 2)
                 .name("__heap_base").raw(0x03).uleb(0);
         Buf locals = new Buf().vec(2).uleb(8).raw(0x7F).uleb(2).raw(0x7E);
         Buf mainBody = body(locals, new Buf().buf(main.b).raw(0x41, 0x00, 0x0B));
         Buf abiBody = body(new Buf().vec(0), new Buf().raw(0x41).sleb(abiVersion).raw(0x0B));
-        Buf code = new Buf().vec(2).buf(mainBody).buf(abiBody);
+        Buf pluginAbiBody = body(new Buf().vec(0),
+                new Buf().raw(0x41).sleb(pluginAbiVersion).raw(0x0B));
+        Buf code = new Buf().vec(3).buf(mainBody).buf(abiBody).buf(pluginAbiBody);
 
         byte[] letters = new byte[26];
         for (int i = 0; i < letters.length; i++) {
