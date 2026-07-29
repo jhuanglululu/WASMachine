@@ -154,28 +154,23 @@ public final class MachineInstance {
     }
 
     /**
-     * Everything an embedder can ask about a running instance right now: the instant gauges and
-     * the run-lifetime totals, raw. No formatting, no derived percentages — presentation is the
-     * embedder's, and so is anything the engine cannot see (entities, restarts, wall clock).
+     * What an embedder can read off a running instance without anything having been measured
+     * beforehand: live gauges the engine holds anyway, raw. No formatting, no derived
+     * percentages — presentation is the embedder's, and so is anything the engine cannot see
+     * (entities, restarts, wall clock).
      *
-     * @param lastTickInstructions instructions the most recent {@link #tick} spent ({@code 0}
-     *                             before the first one)
-     * @param memoryUsedBytes      bytes charged right now: guest heaps plus channel buffers
-     * @param memoryPeakBytes      the most ever charged at once during this run
-     * @param memoryCapBytes       the configured per-instance cap
-     * @param liveTasks            tasks that have not finished, task 0 included
-     * @param totalForks           forks over the run (each one created a task)
-     * @param uptimeTicks          {@link #tick} calls that actually ran the scheduler
-     * @param totalInstructions    instructions spent over the whole run
-     * @param nonDeterministicDraws draws from the non-deterministic stream; {@code 0} means the
-     *                             run is reproducible from its seed
+     * <p>Deliberately no run totals. Nothing is tracked until a command asks for it: an
+     * instance nobody is looking at should carry no measuring cost at all, so anything
+     * per-tick lives in a {@link CaptureSummary} instead of a standing counter.
+     *
+     * @param memoryUsedBytes bytes charged right now: guest heaps plus channel buffers
+     * @param memoryCapBytes  the configured per-instance cap
+     * @param liveTasks       tasks that have not finished, task 0 included
+     * @param totalForks      forks so far — free, since the task-id counter already implies it
      */
     public record StatsSnapshot(
-            long lastTickInstructions,
-            long memoryUsedBytes, long memoryPeakBytes, long memoryCapBytes,
-            int liveTasks, int totalForks,
-            long uptimeTicks, long totalInstructions,
-            long nonDeterministicDraws) {}
+            long memoryUsedBytes, long memoryCapBytes,
+            int liveTasks, int totalForks) {}
 
     /**
      * What a finished capture window saw. One sample is one whole {@link #tick} call, so
@@ -193,9 +188,9 @@ public final class MachineInstance {
      * @param instructionsMax dearest tick in the window
      * @param instructionsSum total over the window — divide by {@code ticksCaptured} for the mean
      * @param memorySumBytes  sum of the end-of-tick memory readings, the basis for a mean
-     * @param memoryPeakBytes highest end-of-tick reading in the window. Note this is a sampled
-     *                        peak: a spike that rose and fell inside one tick is invisible here,
-     *                        which is what {@link StatsSnapshot#memoryPeakBytes()} is for
+     * @param memoryPeakBytes highest end-of-tick reading in the window. A <em>sampled</em> peak:
+     *                        memory that rose and fell inside a single tick is invisible to it,
+     *                        which is the price of holding no standing watermark
      */
     public record CaptureSummary(
             long ticksCaptured, boolean complete,
@@ -269,12 +264,6 @@ public final class MachineInstance {
     // be reproducible must never touch it, and this is the only way to tell from outside: the
     // deterministic and non-deterministic imports are both linked whenever either can be reached.
     private long nonDeterministicDraws;
-
-    // Run totals: a handful of longs updated once per tick, which is why they can be always-on
-    // while sampling is not (see startCapture).
-    private long uptimeTicks;
-    private long totalInstructions;
-    private long lastTickInstructions;
 
     private Capture capture;              // the armed capture, or null
     private CaptureSummary lastCapture;   // the most recent finished one, or null
@@ -381,17 +370,14 @@ public final class MachineInstance {
     }
 
     /**
-     * Everything measurable about this instance right now — instant gauges plus run totals, from
-     * counters the engine maintains anyway. Cheap enough to call every tick, though nothing needs
-     * to: the numbers only move when {@link #tick} runs.
+     * The live gauges, read on the spot. Nothing was accumulated to make this possible — every
+     * field is state the engine holds for its own reasons — so an instance that is never asked
+     * about pays nothing.
      */
     public StatsSnapshot stats() {
         return new StatsSnapshot(
-                lastTickInstructions,
-                budget.used(), budget.peakUsed(), budget.capBytes(),
-                liveTasks(), nextTaskId - 1,
-                uptimeTicks, totalInstructions,
-                nonDeterministicDraws);
+                budget.used(), budget.capBytes(),
+                liveTasks(), nextTaskId - 1);
     }
 
     private int liveTasks() {
@@ -436,6 +422,23 @@ public final class MachineInstance {
         if (terminal != null) {
             endCapture(false);
         }
+        return true;
+    }
+
+    /**
+     * Closes an armed window now, keeping every sample it has already taken. The summary reports
+     * {@code complete = false}, because the window did not run the length it was armed for — the
+     * engine cannot tell "the instance died" from "somebody clicked stop", and the embedder that
+     * called this is the one that knows.
+     *
+     * @return {@code false} if no capture was armed, in which case nothing changed and any
+     *     previous {@link #captureResult()} still stands
+     */
+    public boolean stopCapture() {
+        if (capture == null) {
+            return false;
+        }
+        endCapture(false);
         return true;
     }
 
@@ -513,21 +516,20 @@ public final class MachineInstance {
     }
 
     /**
-     * Books one completed {@link #tick} into the run totals, and into the capture window if one
-     * is armed. A tick that ended the instance still counts: the work it did was real, but it
-     * closes the window as incomplete, because the rest of the window can never happen.
+     * Books one completed {@link #tick} into the capture window, if one is armed — and does
+     * nothing at all otherwise, which is the point: an unmeasured instance accumulates no
+     * statistics. A tick that ended the instance still counts as a sample (the work it did was
+     * real), but it closes the window as incomplete, because the rest of it can never happen.
      */
     private void recordTick(TickResult result) {
-        lastTickInstructions = tickBudget - remainingFuel;
-        totalInstructions += lastTickInstructions;
-        uptimeTicks++;
-        if (capture != null) {
-            capture.sample(lastTickInstructions, budget.used());
-            if (!(result instanceof TickResult.Running)) {
-                endCapture(false);
-            } else if (capture.remainingTicks <= 0) {
-                endCapture(true);
-            }
+        if (capture == null) {
+            return;
+        }
+        capture.sample(tickBudget - remainingFuel, budget.used());
+        if (!(result instanceof TickResult.Running)) {
+            endCapture(false);
+        } else if (capture.remainingTicks <= 0) {
+            endCapture(true);
         }
     }
 

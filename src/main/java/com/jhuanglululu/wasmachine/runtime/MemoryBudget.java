@@ -20,7 +20,6 @@ public final class MemoryBudget {
 
     private final long capBytes;
     private long used;
-    private long peakUsed;
 
     public MemoryBudget(long capBytes) {
         this.capBytes = capBytes;
@@ -37,15 +36,6 @@ public final class MemoryBudget {
     }
 
     /**
-     * The most bytes ever charged at once — the number that answers "how close did this run
-     * actually get to its cap", which {@link #used()} cannot: a spike between two ticks is
-     * invisible to any sampler. One {@code max} in the charge path, so it costs nothing.
-     */
-    public synchronized long peakUsed() {
-        return peakUsed;
-    }
-
-    /**
      * Charges {@code bytes} against the cap.
      *
      * @param what what the bytes are for, named in the failure message
@@ -59,7 +49,6 @@ public final class MemoryBudget {
                     + used + " already held");
         }
         used = total;
-        peakUsed = Math.max(peakUsed, total);
     }
 
     /** Gives {@code bytes} back (a freed heap block, a dequeued message, a finished task). */

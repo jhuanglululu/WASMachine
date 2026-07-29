@@ -12,25 +12,22 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /**
- * Run totals and the on-demand capture window, through real guests.
+ * The live gauges and the on-demand capture window, through real guests.
  *
- * <p>What is actually worth pinning here is the arithmetic nobody can verify by reading: that a
- * window's samples add up to the same instructions the independent run total moved by, that the
- * memory watermark survives the free that ends it, and that an instance dying inside a window
- * reports what it saw instead of a full-length lie.
+ * <p>Nothing is accumulated unless a capture is armed, so a window's numbers cannot be checked
+ * against a standing total. They are anchored two other ways instead: against the interpreter's
+ * own fuel accounting, which is an entirely separate mechanism from sampling, and against the
+ * same three ticks measured in a different shape (three one-tick captures instead of one
+ * three-tick capture). The guests are straight-line and deterministic, so both anchors are exact.
  */
 class StatsTest {
 
     private static final long BUDGET = 10_000_000L;
 
     private static MachineInstance instance(P main) {
-        return instance(main, 1 << 20);
-    }
-
-    private static MachineInstance instance(P main, long memoryCap) {
         return new MachineInstance(Module.parse(SyncWasm.module(main)),
                 new MachineInstance.Config("stats", RuntimeWasm.ENGINE_MODULE, "_engine_main",
-                        List.of(SyncRun.ENGINE_ABI), memoryCap, 0L),
+                        List.of(SyncRun.ENGINE_ABI), 1 << 20, 0L),
                 (name, message) -> { }, SyncWasm.stubPluginImports());
     }
 
@@ -43,53 +40,80 @@ class StatsTest {
         return p;
     }
 
-    @Test
-    void aCaptureWindowAddsUpToTheRunTotalItSpanned() {
-        // Three ticks of deliberately unequal work: one log, then thirty, then one again.
-        P main = new P()
+    /** Three ticks of deliberately unequal work: one log, then thirty, then one again. */
+    private static P unevenWork() {
+        return new P()
                 .log(0).sleep(1)
                 .append(busy(30)).sleep(1)
                 .log(2).sleep(1)
                 .log(3);
-        MachineInstance inst = instance(main);
-
-        MachineInstance.StatsSnapshot before = inst.stats();
-        assertEquals(0, before.lastTickInstructions(), "nothing has run yet");
-        assertTrue(inst.startCapture(3));
-        assertEquals(3, inst.captureRemainingTicks());
-
-        for (long t = 0; t < 3; t++) {
-            assertInstanceOf(TickResult.Running.class, inst.tick(t, BUDGET));
-            if (t == 0) {
-                // A second admin measuring the same instance must not restart the window.
-                assertFalse(inst.startCapture(50), "a capture is already armed");
-                assertEquals(2, inst.captureRemainingTicks(), "the running window is untouched");
-            }
-        }
-
-        MachineInstance.StatsSnapshot after = inst.stats();
-        MachineInstance.CaptureSummary window = inst.captureResult().orElseThrow();
-
-        assertEquals(0, inst.captureRemainingTicks(), "the window closed on its last tick");
-        assertEquals(3, window.ticksCaptured());
-        assertTrue(window.complete(), "it ran the full length it was armed for");
-        // The round trip: the samples must account for exactly the instructions the independent
-        // run counter moved by over the same three ticks.
-        assertEquals(after.totalInstructions() - before.totalInstructions(),
-                window.instructionsSum());
-        assertTrue(window.instructionsMin() < window.instructionsMax(),
-                "the middle tick did thirty times the host calls: " + window);
-        assertEquals(after.lastTickInstructions(), inst.stats().lastTickInstructions());
-        assertEquals(3, after.uptimeTicks());
-        assertEquals(1, after.liveTasks());
-        assertEquals(0, after.totalForks());
     }
 
     @Test
-    void theMemoryPeakOutlivesTheAllocationThatSetIt() {
-        // Allocate, hold across a tick boundary, then free: `used` comes back down, the watermark
-        // does not — which is the whole reason the watermark exists, since a sampler that only
-        // reads `used` at tick ends would report this run as having used nothing.
+    void aSampleMatchesTheInterpretersOwnFuelAccounting() {
+        // The anchor: fuel exhaustion is decided inside the dispatch loop, with no reference to
+        // the sampler. If a one-tick window says the tick cost N instructions, then N fuel must
+        // be exactly enough to reach the guest's first blocking point — and N-1 must not be.
+        MachineInstance measured = instance(unevenWork());
+        assertTrue(measured.startCapture(1));
+        assertInstanceOf(TickResult.Running.class, measured.tick(0, BUDGET));
+        long n = measured.captureResult().orElseThrow().instructionsSum();
+        assertTrue(n > 0);
+
+        assertInstanceOf(TickResult.Running.class, instance(unevenWork()).tick(0, n),
+                "exactly the sampled instruction count must reach the sleep");
+        TickResult starved = instance(unevenWork()).tick(0, n - 1);
+        assertInstanceOf(TickResult.Errored.class, starved,
+                "one instruction less must not, or the sample over-counted");
+        assertTrue(((TickResult.Errored) starved).message().contains("budget"));
+    }
+
+    @Test
+    void aWindowAggregatesExactlyTheTicksItCovers() {
+        // One three-tick window, then the same three ticks measured as three one-tick windows:
+        // a differently shaped measurement of identical work, so the aggregates must agree.
+        MachineInstance whole = instance(unevenWork());
+        assertTrue(whole.startCapture(3));
+        assertEquals(3, whole.captureRemainingTicks());
+        for (long t = 0; t < 3; t++) {
+            assertInstanceOf(TickResult.Running.class, whole.tick(t, BUDGET));
+            if (t == 0) {
+                // A second admin measuring the same instance must not restart the window.
+                assertFalse(whole.startCapture(50), "a capture is already armed");
+                assertEquals(2, whole.captureRemainingTicks(), "the running window is untouched");
+            }
+        }
+        MachineInstance.CaptureSummary window = whole.captureResult().orElseThrow();
+
+        MachineInstance perTick = instance(unevenWork());
+        long sum = 0;
+        long min = Long.MAX_VALUE;
+        long max = 0;
+        for (long t = 0; t < 3; t++) {
+            assertTrue(perTick.startCapture(1));
+            assertInstanceOf(TickResult.Running.class, perTick.tick(t, BUDGET));
+            long one = perTick.captureResult().orElseThrow().instructionsSum();
+            sum += one;
+            min = Math.min(min, one);
+            max = Math.max(max, one);
+        }
+
+        assertEquals(3, window.ticksCaptured());
+        assertTrue(window.complete(), "it ran the full length it was armed for");
+        assertEquals(0, whole.captureRemainingTicks(), "the window closed on its last tick");
+        assertEquals(sum, window.instructionsSum());
+        assertEquals(min, window.instructionsMin());
+        assertEquals(max, window.instructionsMax());
+        assertTrue(window.instructionsMin() < window.instructionsMax(),
+                "the middle tick did thirty times the host calls: " + window);
+        assertEquals((double) sum / 3, window.meanInstructions());
+    }
+
+    @Test
+    void theWindowRemembersMemoryTheGaugeNoLongerShows() {
+        // Allocate, hold across a tick boundary, then free. The gauge reads nothing afterwards,
+        // so the window's sampled peak is the only remaining evidence the run ever held
+        // anything — which is the whole reason the window records one.
         int size = 4096;
         P main = new P()
                 .i32(0).i32(0).i32(8).i32(size).call(REALLOC).set(0)
@@ -97,18 +121,46 @@ class StatsTest {
                 .get(0).i32(size).i32(8).i32(0).call(REALLOC).drop();
         MachineInstance inst = instance(main);
 
+        assertTrue(inst.startCapture(2));
         assertInstanceOf(TickResult.Running.class, inst.tick(0, BUDGET));
         MachineInstance.StatsSnapshot held = inst.stats();
         assertTrue(held.memoryUsedBytes() >= size,
                 "the heap should be charged while held, was " + held.memoryUsedBytes());
-        assertTrue(held.memoryPeakBytes() >= held.memoryUsedBytes());
         assertEquals(1 << 20, held.memoryCapBytes());
+        assertEquals(1, held.liveTasks());
+        assertEquals(0, held.totalForks());
 
         assertInstanceOf(TickResult.Finished.class, inst.tick(1, BUDGET));
-        MachineInstance.StatsSnapshot freed = inst.stats();
-        assertEquals(0, freed.memoryUsedBytes(), "the free gave every byte back");
-        assertEquals(held.memoryPeakBytes(), freed.memoryPeakBytes(), "but the peak stands");
-        assertTrue(freed.memoryPeakBytes() >= size);
+        assertEquals(0, inst.stats().memoryUsedBytes(), "the free gave every byte back");
+
+        MachineInstance.CaptureSummary window = inst.captureResult().orElseThrow();
+        assertEquals(2, window.ticksCaptured());
+        assertEquals(held.memoryUsedBytes(), window.memoryPeakBytes(),
+                "the window kept the reading the gauge has since lost");
+        assertTrue(window.memoryPeakBytes() >= size);
+    }
+
+    @Test
+    void stopCaptureKeepsWhatItSawAndClosesTheWindow() {
+        MachineInstance inst = instance(unevenWork());
+
+        assertTrue(inst.startCapture(50));
+        for (long t = 0; t < 3; t++) {
+            assertInstanceOf(TickResult.Running.class, inst.tick(t, BUDGET));
+        }
+        assertTrue(inst.stopCapture());
+
+        MachineInstance.CaptureSummary window = inst.captureResult().orElseThrow();
+        assertEquals(3, window.ticksCaptured(), "every sample taken so far is kept");
+        assertFalse(window.complete(), "47 of the 50 ticks never happened");
+        assertTrue(window.instructionsSum() > 0);
+        assertEquals(0, inst.captureRemainingTicks());
+
+        // The window is closed, so ticking on adds nothing to it — not even the tick that ends
+        // the run, which would otherwise have been the sample that closed it.
+        assertInstanceOf(TickResult.Finished.class, inst.tick(3, BUDGET));
+        assertEquals(window, inst.captureResult().orElseThrow());
+        assertFalse(inst.stopCapture(), "nothing left to stop");
     }
 
     @Test
@@ -125,11 +177,9 @@ class StatsTest {
         assertEquals(window.instructionsMin(), window.instructionsMax(), "one sample");
         assertEquals(0, inst.captureRemainingTicks());
 
-        // Polling a dead instance is not a tick: it adds no sample and moves no total.
-        long uptime = inst.stats().uptimeTicks();
+        // Polling a dead instance is not a tick: it adds no sample.
         assertInstanceOf(TickResult.Finished.class, inst.tick(1, BUDGET));
         assertEquals(window, inst.captureResult().orElseThrow());
-        assertEquals(uptime, inst.stats().uptimeTicks());
 
         // And arming a fresh window on the corpse closes it at once rather than waiting on a
         // tick that can never come.
