@@ -153,6 +153,97 @@ public final class MachineInstance {
         }
     }
 
+    /**
+     * Everything an embedder can ask about a running instance right now: the instant gauges and
+     * the run-lifetime totals, raw. No formatting, no derived percentages — presentation is the
+     * embedder's, and so is anything the engine cannot see (entities, restarts, wall clock).
+     *
+     * @param lastTickInstructions instructions the most recent {@link #tick} spent ({@code 0}
+     *                             before the first one)
+     * @param memoryUsedBytes      bytes charged right now: guest heaps plus channel buffers
+     * @param memoryPeakBytes      the most ever charged at once during this run
+     * @param memoryCapBytes       the configured per-instance cap
+     * @param liveTasks            tasks that have not finished, task 0 included
+     * @param totalForks           forks over the run (each one created a task)
+     * @param uptimeTicks          {@link #tick} calls that actually ran the scheduler
+     * @param totalInstructions    instructions spent over the whole run
+     * @param nonDeterministicDraws draws from the non-deterministic stream; {@code 0} means the
+     *                             run is reproducible from its seed
+     */
+    public record StatsSnapshot(
+            long lastTickInstructions,
+            long memoryUsedBytes, long memoryPeakBytes, long memoryCapBytes,
+            int liveTasks, int totalForks,
+            long uptimeTicks, long totalInstructions,
+            long nonDeterministicDraws) {}
+
+    /**
+     * What a finished capture window saw. One sample is one whole {@link #tick} call, so
+     * {@code ticksCaptured} counts ticks that ran the scheduler — not wall time, and not ticks
+     * a dead instance was polled on.
+     *
+     * <p>Only aggregates are kept: nothing needs the raw series, and accumulating min/max/sum on
+     * the fly is what keeps a capture free of allocation.
+     *
+     * @param ticksCaptured   samples taken ({@code 0} is possible: the instance may have died
+     *                        before its first tick in the window)
+     * @param complete        whether the window ran to the length it was armed for; {@code false}
+     *                        means the instance ended first and this covers what was seen
+     * @param instructionsMin cheapest tick in the window ({@code 0} if nothing was captured)
+     * @param instructionsMax dearest tick in the window
+     * @param instructionsSum total over the window — divide by {@code ticksCaptured} for the mean
+     * @param memorySumBytes  sum of the end-of-tick memory readings, the basis for a mean
+     * @param memoryPeakBytes highest end-of-tick reading in the window. Note this is a sampled
+     *                        peak: a spike that rose and fell inside one tick is invisible here,
+     *                        which is what {@link StatsSnapshot#memoryPeakBytes()} is for
+     */
+    public record CaptureSummary(
+            long ticksCaptured, boolean complete,
+            long instructionsMin, long instructionsMax, long instructionsSum,
+            long memorySumBytes, long memoryPeakBytes) {
+
+        /** Mean instructions per captured tick, or {@code 0} if nothing was captured. */
+        public double meanInstructions() {
+            return ticksCaptured == 0 ? 0 : (double) instructionsSum / ticksCaptured;
+        }
+
+        /** Mean end-of-tick memory over the window, or {@code 0} if nothing was captured. */
+        public double meanMemoryBytes() {
+            return ticksCaptured == 0 ? 0 : (double) memorySumBytes / ticksCaptured;
+        }
+    }
+
+    /** An armed capture: counters only, so a tick's sample allocates nothing. */
+    private static final class Capture {
+        long remainingTicks;
+        long ticksCaptured;
+        long instructionsMin = Long.MAX_VALUE;
+        long instructionsMax;
+        long instructionsSum;
+        long memorySum;
+        long memoryPeak;
+
+        Capture(long ticks) {
+            this.remainingTicks = ticks;
+        }
+
+        void sample(long instructions, long memoryUsed) {
+            ticksCaptured++;
+            remainingTicks--;
+            instructionsMin = Math.min(instructionsMin, instructions);
+            instructionsMax = Math.max(instructionsMax, instructions);
+            instructionsSum += instructions;
+            memorySum += memoryUsed;
+            memoryPeak = Math.max(memoryPeak, memoryUsed);
+        }
+
+        CaptureSummary summarize(boolean complete) {
+            return new CaptureSummary(ticksCaptured, complete,
+                    ticksCaptured == 0 ? 0 : instructionsMin, instructionsMax, instructionsSum,
+                    memorySum, memoryPeak);
+        }
+    }
+
     private final Config config;
     private final LogSink logSink;
 
@@ -178,6 +269,15 @@ public final class MachineInstance {
     // be reproducible must never touch it, and this is the only way to tell from outside: the
     // deterministic and non-deterministic imports are both linked whenever either can be reached.
     private long nonDeterministicDraws;
+
+    // Run totals: a handful of longs updated once per tick, which is why they can be always-on
+    // while sampling is not (see startCapture).
+    private long uptimeTicks;
+    private long totalInstructions;
+    private long lastTickInstructions;
+
+    private Capture capture;              // the armed capture, or null
+    private CaptureSummary lastCapture;   // the most recent finished one, or null
 
     private TickResult terminal; // set once the instance ends (Finished/Errored)
 
@@ -281,6 +381,83 @@ public final class MachineInstance {
     }
 
     /**
+     * Everything measurable about this instance right now — instant gauges plus run totals, from
+     * counters the engine maintains anyway. Cheap enough to call every tick, though nothing needs
+     * to: the numbers only move when {@link #tick} runs.
+     */
+    public StatsSnapshot stats() {
+        return new StatsSnapshot(
+                lastTickInstructions,
+                budget.used(), budget.peakUsed(), budget.capBytes(),
+                liveTasks(), nextTaskId - 1,
+                uptimeTicks, totalInstructions,
+                nonDeterministicDraws);
+    }
+
+    private int liveTasks() {
+        int live = 0;
+        for (Task t : tasks) {
+            if (t.state != TaskState.FINISHED) {
+                live++;
+            }
+        }
+        return live;
+    }
+
+    /**
+     * Arms a capture over the next {@code ticks} {@link #tick} calls: one sample per tick, of the
+     * instructions it spent and the memory charged when it ended. Sampling is deliberately
+     * on-demand rather than a standing ring buffer — an idle instance should carry no measuring
+     * cost at all — so nothing is recorded until an embedder asks.
+     *
+     * <p>Starting a capture discards the previous {@link #captureResult()}, so a poller can never
+     * mistake the old summary for the new window's.
+     *
+     * <p>A window only ever covers ticks the instance actually runs. Arming one on an instance
+     * that has already ended therefore closes it immediately with no samples, rather than leaving
+     * a poller waiting on a tick that can never come.
+     *
+     * @param ticks how many ticks to sample, at least 1
+     * @return {@code false} if a capture is already armed, in which case nothing changes — the
+     *     running window keeps its samples and the caller can read
+     *     {@link #captureRemainingTicks()}. This is a refusal rather than a throw because
+     *     "somebody is already measuring this" is a normal race between two admins, not a bug.
+     * @throws IllegalArgumentException if {@code ticks} is not positive
+     */
+    public boolean startCapture(int ticks) {
+        if (ticks <= 0) {
+            throw new IllegalArgumentException("a capture must span at least one tick, got " + ticks);
+        }
+        if (capture != null) {
+            return false;
+        }
+        lastCapture = null;
+        capture = new Capture(ticks);
+        if (terminal != null) {
+            endCapture(false);
+        }
+        return true;
+    }
+
+    /**
+     * Ticks left in the armed capture, or {@code 0} when none is armed — so {@code > 0} is also
+     * the "a capture is running" test. An armed capture always has at least one tick left: the
+     * one that takes the last sample ends the window.
+     */
+    public long captureRemainingTicks() {
+        return capture == null ? 0 : capture.remainingTicks;
+    }
+
+    /**
+     * The most recently finished capture, if one has finished since it was armed. Empty while a
+     * capture is still running and before the first one; the summary stays readable afterwards so
+     * an embedder can poll for it rather than being called back.
+     */
+    public Optional<CaptureSummary> captureResult() {
+        return Optional.ofNullable(lastCapture);
+    }
+
+    /**
      * Advances the guest by one game tick: resumes every due task in spawn order,
      * sharing {@code fuelBudget} instructions across them.
      *
@@ -290,38 +467,75 @@ public final class MachineInstance {
      */
     public TickResult tick(long currentTick, long fuelBudget) {
         if (terminal != null) {
+            // A dead instance runs nothing, so it can produce no sample. Close any armed capture
+            // rather than leave a caller waiting on a window that can never fill.
+            endCapture(false);
             return terminal;
         }
         this.tickBudget = fuelBudget;
         this.remainingFuel = fuelBudget;
         releasedThisRound.clear();
+        TickResult result;
         try {
-            List<Integer> ranThisRound = new ArrayList<>();
-            boolean ranSinceClear = false;
-            while (true) {
-                Task cand = pickRunnable(currentTick, ranThisRound);
-                if (cand == null) {
-                    if (!ranSinceClear) {
-                        break;
-                    }
-                    ranThisRound.clear();
-                    releasedThisRound.clear();
-                    ranSinceClear = false;
-                    continue;
-                }
-                ranThisRound.add(cand.id);
-                ranSinceClear = true;
-                TickResult r = runTurn(cand, currentTick);
-                if (r != null) {
-                    this.terminal = r;
-                    return r;
-                }
-            }
+            result = runRounds(currentTick);
         } catch (GuestAbort e) {
             this.terminal = new TickResult.Errored(e.getMessage());
-            return this.terminal;
+            result = this.terminal;
+        }
+        recordTick(result);
+        return result;
+    }
+
+    /** The tick's scheduling loop: rounds of due tasks until nothing is left to run. */
+    private TickResult runRounds(long currentTick) {
+        List<Integer> ranThisRound = new ArrayList<>();
+        boolean ranSinceClear = false;
+        while (true) {
+            Task cand = pickRunnable(currentTick, ranThisRound);
+            if (cand == null) {
+                if (!ranSinceClear) {
+                    break;
+                }
+                ranThisRound.clear();
+                releasedThisRound.clear();
+                ranSinceClear = false;
+                continue;
+            }
+            ranThisRound.add(cand.id);
+            ranSinceClear = true;
+            TickResult r = runTurn(cand, currentTick);
+            if (r != null) {
+                this.terminal = r;
+                return r;
+            }
         }
         return new TickResult.Running();
+    }
+
+    /**
+     * Books one completed {@link #tick} into the run totals, and into the capture window if one
+     * is armed. A tick that ended the instance still counts: the work it did was real, but it
+     * closes the window as incomplete, because the rest of the window can never happen.
+     */
+    private void recordTick(TickResult result) {
+        lastTickInstructions = tickBudget - remainingFuel;
+        totalInstructions += lastTickInstructions;
+        uptimeTicks++;
+        if (capture != null) {
+            capture.sample(lastTickInstructions, budget.used());
+            if (!(result instanceof TickResult.Running)) {
+                endCapture(false);
+            } else if (capture.remainingTicks <= 0) {
+                endCapture(true);
+            }
+        }
+    }
+
+    private void endCapture(boolean complete) {
+        if (capture != null) {
+            lastCapture = capture.summarize(complete);
+            capture = null;
+        }
     }
 
     private Task pickRunnable(long currentTick, List<Integer> ranThisRound) {
