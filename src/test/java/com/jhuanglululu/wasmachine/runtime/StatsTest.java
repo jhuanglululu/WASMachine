@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.jhuanglululu.wasm.Module;
 import com.jhuanglululu.wasmachine.runtime.SyncWasm.P;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -28,7 +29,7 @@ class StatsTest {
         return new MachineInstance(Module.parse(SyncWasm.module(main)),
                 new MachineInstance.Config("stats", RuntimeWasm.ENGINE_MODULE, "_engine_main",
                         List.of(SyncRun.ENGINE_ABI), 1 << 20, 0L),
-                (name, message) -> { }, SyncWasm.stubPluginImports());
+                (name, message) -> { }, Map.of());
     }
 
     /** {@code n} host calls worth of work, so one tick can be made visibly dearer than another. */

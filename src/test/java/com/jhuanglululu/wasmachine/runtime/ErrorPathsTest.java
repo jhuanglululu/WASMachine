@@ -27,7 +27,7 @@ class ErrorPathsTest {
         return new MachineInstance(Module.parse(moduleBytes),
                 new MachineInstance.Config("err", RuntimeWasm.ENGINE_MODULE, "_engine_main",
                         List.of(check), cap, 0L),
-                (name, message) -> { }, SyncWasm.stubPluginImports());
+                (name, message) -> { }, Map.of());
     }
 
     private static TickResult drive(MachineInstance inst, long budget) {

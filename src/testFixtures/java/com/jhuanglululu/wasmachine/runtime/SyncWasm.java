@@ -1,27 +1,24 @@
 package com.jhuanglululu.wasmachine.runtime;
 
-import com.jhuanglululu.wasm.HostFunction;
 import com.jhuanglululu.wasmachine.runtime.RuntimeWasm.Buf;
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Hand-rolled WebAssembly modules for the engine imports — tasks, sync, random and the math
- * kernel — plus the plugin-owned entity and effect names an embedder supplies. Like
- * {@link RuntimeWasm} it writes section framing by hand, so the tests exercise the real
- * interpreter and the real host-import path rather than a stand-in for them.
+ * kernel. Like {@link RuntimeWasm} it writes section framing by hand, so the tests exercise
+ * the real interpreter and the real host-import path rather than a stand-in for them.
  *
  * <p>Every module has the same shape: one import table (indices are the {@code *} constants
  * below), a 1-page memory whose first 26 bytes are {@code "ABC…Z"} (so {@code log(i, 1)}
  * prints the {@code i}-th letter and {@code channel_send(ch, i, 1)} sends it), scratch space
  * from byte 64 up, and a {@code _engine_main} body supplied by the test through {@link P}.
- * {@code _engine_abi} returns {@link MachineInstance#ENGINE_ABI_VERSION} and the plugin
- * handshake {@value #PLUGIN_ABI_EXPORT} returns {@value #PLUGIN_ABI_VERSION}.
+ * {@code _engine_abi} returns {@link MachineInstance#ENGINE_ABI_VERSION}.
  *
- * <p>Imports are declared against two modules, as ABI 3 requires: the engine's own names under
- * {@value RuntimeWasm#ENGINE_MODULE} and the plugin-owned entity/effect names under
- * {@value RuntimeWasm#PLUGIN_MODULE}.
+ * <p>The engine does not know any embedder's vocabulary — ABI 3 made that boundary
+ * structural. An embedder whose own imports are under test appends them through a
+ * {@link Surface}: its imports land after the engine's in the one import table, declared
+ * against the embedder's module, and its handshake export is emitted beside the engine's.
  */
 public final class SyncWasm {
 
@@ -52,67 +49,25 @@ public final class SyncWasm {
     public static final int RANDOM_DET = 21;
     public static final int SEED_RANDOM = 22;
     public static final int FAIL = 23;
-    // ABI v2 entities, then the v1 entity imports the kind-dispatch tests need.
-    public static final int SPAWN_ITEM_DISPLAY = 24;
-    public static final int SPAWN_TEXT_DISPLAY = 25;
-    public static final int SPAWN_ARMOR_STAND = 26;
-    public static final int SPAWN_ITEM = 27;
-    public static final int SET_ITEM = 28;
-    public static final int GET_ITEM_LEN = 29;
-    public static final int GET_ITEM = 30;
-    public static final int SET_DISPLAY_CONTEXT = 31;
-    public static final int GET_DISPLAY_CONTEXT = 32;
-    public static final int SET_BILLBOARD_MODE = 33;
-    public static final int GET_BILLBOARD_MODE = 34;
-    public static final int SET_TEXT = 35;
-    public static final int GET_TEXT_LEN = 36;
-    public static final int GET_TEXT = 37;
-    public static final int SET_TEXT_BACKGROUND = 38;
-    public static final int GET_TEXT_BACKGROUND = 39;
-    public static final int SET_TEXT_OPACITY = 40;
-    public static final int GET_TEXT_OPACITY = 41;
-    public static final int SET_LINE_WIDTH = 42;
-    public static final int GET_LINE_WIDTH = 43;
-    public static final int SET_TEXT_FLAGS = 44;
-    public static final int GET_TEXT_FLAGS = 45;
-    public static final int SET_POSE = 46;
-    public static final int GET_POSE = 47;
-    public static final int SET_EQUIPMENT = 48;
-    public static final int SET_STAND_FLAGS = 49;
-    public static final int GET_STAND_FLAGS = 50;
-    public static final int SET_YAW = 51;
-    public static final int GET_YAW = 52;
-    public static final int PLAY_SOUND = 53;
-    public static final int EMIT_PARTICLE = 54;
-    public static final int EMIT_PARTICLE_DUST = 55;
-    public static final int EMIT_PARTICLE_DUST_TRANSITION = 56;
-    public static final int EMIT_PARTICLE_BLOCK = 57;
-    public static final int EMIT_PARTICLE_ITEM = 58;
-    public static final int SPAWN_BLOCK_DISPLAY = 59;
-    public static final int SET_BLOCK = 60;
-    public static final int SET_POSITION = 61;
-    public static final int SET_ROTATION = 62;
-    public static final int SET_SCALE = 63;
-    public static final int DESPAWN = 64;
-    public static final int GET_POSITION = 65;
-    public static final int GET_BLOCK_LEN = 66;
-    public static final int GET_BLOCK = 67;
-    public static final int REALLOC = 68;
-    // The engine math kernel (guest-abi.md); appended last so every index above is unchanged.
-    public static final int CBRT = 69;
-    public static final int POW = 70;
-    public static final int EXP = 71;
-    public static final int LN = 72;
-    public static final int LOG10 = 73;
-    public static final int SIN = 74;
-    public static final int COS = 75;
-    public static final int TAN = 76;
-    public static final int ASIN = 77;
-    public static final int ACOS = 78;
-    public static final int ATAN2 = 79;
-    public static final int FORMAT_F64 = 80;
+    public static final int REALLOC = 24;
+    // The engine math kernel (guest-abi.md).
+    public static final int CBRT = 25;
+    public static final int POW = 26;
+    public static final int EXP = 27;
+    public static final int LN = 28;
+    public static final int LOG10 = 29;
+    public static final int SIN = 30;
+    public static final int COS = 31;
+    public static final int TAN = 32;
+    public static final int ASIN = 33;
+    public static final int ACOS = 34;
+    public static final int ATAN2 = 35;
+    public static final int FORMAT_F64 = 36;
 
-    private static final int IMPORT_COUNT = 81;
+    /** Where a {@link Surface}'s imports start: the engine's own end at this index. */
+    public static final int ENGINE_IMPORT_COUNT = 37;
+
+    private static final int ENGINE_TYPE_COUNT = 13;
 
     /** Scratch address for received channel payloads (well clear of the letter table). */
     public static final int SCRATCH = 64;
@@ -213,7 +168,7 @@ public final class SyncWasm {
             return this;
         }
 
-        /** The three origin-relative f64 coordinates every spawner and effect import ends with. */
+        /** Three consecutive {@code f64.const}s, for imports taking an (x, y, z) triple. */
         public P xyz(double x, double y, double z) {
             return f64(x).f64(y).f64(z);
         }
@@ -251,28 +206,69 @@ public final class SyncWasm {
     }
 
     /**
-     * The plugin handshake version these modules report. The fixture stands in for a whole
-     * embedder — it already declares the plugin's imports — so it exports the plugin's
-     * handshake beside the engine's, which is what an embedder's own load check reads.
+     * An embedder-owned import surface: the imports a plugin's host registers and the
+     * handshake export its load check reads. The engine fixture stays vocabulary-free; the
+     * embedder's own test tree declares its names here and keeps the index constants
+     * {@link #imp} hands back. Registered types may duplicate engine signatures — the type
+     * section tolerates duplicates, and locality beats sharing in a fixture.
      */
-    public static final int PLUGIN_ABI_VERSION = 3;
+    public static final class Surface {
 
-    /** The plugin handshake export, named for the embedder these fixtures stand in for. */
-    public static final String PLUGIN_ABI_EXPORT = "_billboard_abi";
+        private final String module;
+        private final String abiExport;
+        private final List<int[]> types = new ArrayList<>();
+        private final List<String> names = new ArrayList<>();
+        private final List<Integer> typeIndices = new ArrayList<>();
 
-    /** Wraps {@code main} into a complete module reporting both current ABI versions. */
+        /**
+         * @param module the wasm import module the embedder owns (never the engine's)
+         * @param abiExport the handshake export, e.g. {@code _billboard_abi}
+         */
+        public Surface(String module, String abiExport) {
+            if (RuntimeWasm.ENGINE_MODULE.equals(module)) {
+                throw new IllegalArgumentException("a Surface may not claim the engine module");
+            }
+            this.module = module;
+            this.abiExport = abiExport;
+        }
+
+        /** Registers a raw function-type signature ({@code 0x60 …}); returns its handle. */
+        public int type(int... rawSignature) {
+            types.add(rawSignature.clone());
+            return types.size() - 1;
+        }
+
+        /** Declares the next import with a {@link #type} handle; returns what `call` takes. */
+        public int imp(String name, int type) {
+            names.add(name);
+            typeIndices.add(type);
+            return ENGINE_IMPORT_COUNT + names.size() - 1;
+        }
+
+        public String abiExport() {
+            return abiExport;
+        }
+    }
+
+    /** Wraps {@code main} into an engine-only module reporting the current engine ABI. */
     public static byte[] module(P main) {
         return module(main, MachineInstance.ENGINE_ABI_VERSION);
     }
 
-    /** Wraps {@code main} into a module reporting engine version {@code abiVersion}. */
+    /** Wraps {@code main} into an engine-only module reporting engine version {@code abiVersion}. */
     public static byte[] module(P main, int abiVersion) {
-        return module(main, abiVersion, PLUGIN_ABI_VERSION);
+        return module(main, abiVersion, null, 0);
+    }
+
+    /** Wraps {@code main} into a module carrying {@code surface} beside the engine imports. */
+    public static byte[] module(P main, Surface surface, int surfaceAbiVersion) {
+        return module(main, MachineInstance.ENGINE_ABI_VERSION, surface, surfaceAbiVersion);
     }
 
     /** Wraps {@code main} into a module reporting each handshake version explicitly. */
-    public static byte[] module(P main, int abiVersion, int pluginAbiVersion) {
-        Buf types = new Buf().vec(27)
+    public static byte[] module(P main, int abiVersion, Surface surface, int surfaceAbiVersion) {
+        int surfaceTypes = surface == null ? 0 : surface.types.size();
+        Buf types = new Buf().vec(ENGINE_TYPE_COUNT + surfaceTypes)
                 .raw(0x60, 0x02, 0x7F, 0x7F, 0x00)       // 0 (i32,i32)->()
                 .raw(0x60, 0x00, 0x01, 0x7F)             // 1 ()->(i32)
                 .raw(0x60, 0x01, 0x7E, 0x00)             // 2 (i64)->()
@@ -282,39 +278,20 @@ public final class SyncWasm {
                 .raw(0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F) // 6 (i32,i32)->(i32)
                 .raw(0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x00) // 7 (i32,i32,i32)->()
                 .raw(0x60, 0x00, 0x01, 0x7E)             // 8 ()->(i64)
-                // 9 (i32,i32,f64,f64,f64)->(i32) — the string+position spawners
-                .raw(0x60, 0x05, 0x7F, 0x7F, 0x7C, 0x7C, 0x7C, 0x01, 0x7F)
-                // 10 (f64,f64,f64)->(i32) — spawn_armor_stand
-                .raw(0x60, 0x03, 0x7C, 0x7C, 0x7C, 0x01, 0x7F)
-                .raw(0x60, 0x02, 0x7F, 0x7E, 0x00)       // 11 (i32,i64)->()
-                .raw(0x60, 0x01, 0x7F, 0x01, 0x7E)       // 12 (i32)->(i64)
-                // 13 (i32,i32,f64,f64,f64,i64)->() — set_pose
-                .raw(0x60, 0x06, 0x7F, 0x7F, 0x7C, 0x7C, 0x7C, 0x7E, 0x00)
-                .raw(0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x00) // 14 set_equipment
-                .raw(0x60, 0x03, 0x7F, 0x7C, 0x7E, 0x00) // 15 (i32,f64,i64)->() set_yaw
-                .raw(0x60, 0x01, 0x7F, 0x01, 0x7C)       // 16 (i32)->(f64) get_yaw
-                // 17 play_sound (ptr,len: i32, x,y,z: f64, category: i32, volume,pitch: f64)
-                .raw(0x60, 0x08, 0x7F, 0x7F, 0x7C, 0x7C, 0x7C, 0x7F, 0x7C, 0x7C, 0x00)
-                // 18 emit_particle / _block / _item (ptr,len, x,y,z, count, ox,oy,oz, speed)
-                .raw(0x60, 0x0A, 0x7F, 0x7F, 0x7C, 0x7C, 0x7C, 0x7F, 0x7C, 0x7C, 0x7C, 0x7C, 0x00)
-                // 19 emit_particle_dust (r,g,b,size, x,y,z: f64, count: i32, ox,oy,oz,speed: f64)
-                .raw(0x60, 0x0C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7F,
-                        0x7C, 0x7C, 0x7C, 0x7C, 0x00)
-                // 20 emit_particle_dust_transition (6 colours + size + x,y,z, count, ox,oy,oz,speed)
-                .raw(0x60, 0x0F, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C, 0x7C,
-                        0x7F, 0x7C, 0x7C, 0x7C, 0x7C, 0x00)
-                // 21 (i32,f64,f64,f64,i64)->() — set_position, set_scale
-                .raw(0x60, 0x05, 0x7F, 0x7C, 0x7C, 0x7C, 0x7E, 0x00)
-                // 22 (i32,f64,f64,f64,f64,i64)->() — set_rotation
-                .raw(0x60, 0x06, 0x7F, 0x7C, 0x7C, 0x7C, 0x7C, 0x7E, 0x00)
-                // 23 (i32,i32,i32,i32)->(i32) — realloc
-                .raw(0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F)
-                .raw(0x60, 0x01, 0x7C, 0x01, 0x7C)             // 24 (f64)->(f64) — unary math
-                .raw(0x60, 0x02, 0x7C, 0x7C, 0x01, 0x7C)       // 25 (f64,f64)->(f64) — pow, atan2
-                // 26 (f64,i32,i32,i32)->(i32) — format_f64
+                .raw(0x60, 0x04, 0x7F, 0x7F, 0x7F, 0x7F, 0x01, 0x7F) // 9 realloc
+                .raw(0x60, 0x01, 0x7C, 0x01, 0x7C)             // 10 (f64)->(f64) — unary math
+                .raw(0x60, 0x02, 0x7C, 0x7C, 0x01, 0x7C)       // 11 (f64,f64)->(f64) — pow, atan2
+                // 12 (f64,i32,i32,i32)->(i32) — format_f64
                 .raw(0x60, 0x04, 0x7C, 0x7F, 0x7F, 0x7F, 0x01, 0x7F);
+        if (surface != null) {
+            for (int[] signature : surface.types) {
+                types.raw(signature);
+            }
+        }
 
-        Buf imports = new Buf().vec(IMPORT_COUNT);
+        int surfaceImports = surface == null ? 0 : surface.names.size();
+        int importCount = ENGINE_IMPORT_COUNT + surfaceImports;
+        Buf imports = new Buf().vec(importCount);
         imp(imports, "log", 0);
         imp(imports, "fork", 1);
         imp(imports, "sleep", 2);
@@ -339,80 +316,50 @@ public final class SyncWasm {
         imp(imports, "random_det", 8);
         imp(imports, "seed_random", 2);
         imp(imports, "fail", 0);
-        imp(imports, "spawn_item_display", 9);
-        imp(imports, "spawn_text_display", 9);
-        imp(imports, "spawn_armor_stand", 10);
-        imp(imports, "spawn_item", 9);
-        imp(imports, "set_item", 7);
-        imp(imports, "get_item_len", 5);
-        imp(imports, "get_item", 0);
-        imp(imports, "set_display_context", 0);
-        imp(imports, "get_display_context", 5);
-        imp(imports, "set_billboard_mode", 0);
-        imp(imports, "get_billboard_mode", 5);
-        imp(imports, "set_text", 7);
-        imp(imports, "get_text_len", 5);
-        imp(imports, "get_text", 0);
-        imp(imports, "set_text_background", 11);
-        imp(imports, "get_text_background", 12);
-        imp(imports, "set_text_opacity", 11);
-        imp(imports, "get_text_opacity", 12);
-        imp(imports, "set_line_width", 11);
-        imp(imports, "get_line_width", 12);
-        imp(imports, "set_text_flags", 0);
-        imp(imports, "get_text_flags", 5);
-        imp(imports, "set_pose", 13);
-        imp(imports, "get_pose", 7);
-        imp(imports, "set_equipment", 14);
-        imp(imports, "set_stand_flags", 0);
-        imp(imports, "get_stand_flags", 5);
-        imp(imports, "set_yaw", 15);
-        imp(imports, "get_yaw", 16);
-        imp(imports, "play_sound", 17);
-        imp(imports, "emit_particle", 18);
-        imp(imports, "emit_particle_dust", 19);
-        imp(imports, "emit_particle_dust_transition", 20);
-        imp(imports, "emit_particle_block", 18);
-        imp(imports, "emit_particle_item", 18);
-        imp(imports, "spawn_block_display", 9);
-        imp(imports, "set_block", 7);
-        imp(imports, "set_position", 21);
-        imp(imports, "set_rotation", 22);
-        imp(imports, "set_scale", 21);
-        imp(imports, "despawn", 4);
-        imp(imports, "get_position", 0);
-        imp(imports, "get_block_len", 5);
-        imp(imports, "get_block", 0);
-        imp(imports, "realloc", 23);
-        imp(imports, "cbrt", 24);
-        imp(imports, "pow", 25);
-        imp(imports, "exp", 24);
-        imp(imports, "ln", 24);
-        imp(imports, "log10", 24);
-        imp(imports, "sin", 24);
-        imp(imports, "cos", 24);
-        imp(imports, "tan", 24);
-        imp(imports, "asin", 24);
-        imp(imports, "acos", 24);
-        imp(imports, "atan2", 25);
-        imp(imports, "format_f64", 26);
+        imp(imports, "realloc", 9);
+        imp(imports, "cbrt", 10);
+        imp(imports, "pow", 11);
+        imp(imports, "exp", 10);
+        imp(imports, "ln", 10);
+        imp(imports, "log10", 10);
+        imp(imports, "sin", 10);
+        imp(imports, "cos", 10);
+        imp(imports, "tan", 10);
+        imp(imports, "asin", 10);
+        imp(imports, "acos", 10);
+        imp(imports, "atan2", 11);
+        imp(imports, "format_f64", 12);
+        if (surface != null) {
+            for (int i = 0; i < surface.names.size(); i++) {
+                imports.name(surface.module).name(surface.names.get(i))
+                        .raw(0x00).uleb(ENGINE_TYPE_COUNT + surface.typeIndices.get(i));
+            }
+        }
 
-        // main, the engine handshake and the plugin handshake — all ()->(i32).
-        Buf funcs = new Buf().vec(3).uleb(1).uleb(1).uleb(1);
+        // main and the engine handshake — plus the surface handshake — all ()->(i32).
+        int bodyCount = surface == null ? 2 : 3;
+        Buf funcs = new Buf().vec(bodyCount);
+        for (int i = 0; i < bodyCount; i++) {
+            funcs.uleb(1);
+        }
         Buf memory = new Buf().vec(1).raw(0x00).uleb(1);
         Buf globals = RuntimeWasm.section(6,
                 new Buf().vec(1).raw(0x7F, 0x00).raw(0x41).sleb(1024).raw(0x0B));
-        Buf exports = new Buf().vec(4)
-                .name("_engine_main").raw(0x00).uleb(IMPORT_COUNT)
-                .name("_engine_abi").raw(0x00).uleb(IMPORT_COUNT + 1)
-                .name(PLUGIN_ABI_EXPORT).raw(0x00).uleb(IMPORT_COUNT + 2)
-                .name("__heap_base").raw(0x03).uleb(0);
+        Buf exports = new Buf().vec(bodyCount + 1)
+                .name("_engine_main").raw(0x00).uleb(importCount)
+                .name("_engine_abi").raw(0x00).uleb(importCount + 1);
+        if (surface != null) {
+            exports.name(surface.abiExport).raw(0x00).uleb(importCount + 2);
+        }
+        exports.name("__heap_base").raw(0x03).uleb(0);
         Buf locals = new Buf().vec(2).uleb(8).raw(0x7F).uleb(2).raw(0x7E);
         Buf mainBody = body(locals, new Buf().buf(main.b).raw(0x41, 0x00, 0x0B));
         Buf abiBody = body(new Buf().vec(0), new Buf().raw(0x41).sleb(abiVersion).raw(0x0B));
-        Buf pluginAbiBody = body(new Buf().vec(0),
-                new Buf().raw(0x41).sleb(pluginAbiVersion).raw(0x0B));
-        Buf code = new Buf().vec(3).buf(mainBody).buf(abiBody).buf(pluginAbiBody);
+        Buf code = new Buf().vec(bodyCount).buf(mainBody).buf(abiBody);
+        if (surface != null) {
+            code.buf(body(new Buf().vec(0),
+                    new Buf().raw(0x41).sleb(surfaceAbiVersion).raw(0x0B)));
+        }
 
         byte[] letters = new byte[26];
         for (int i = 0; i < letters.length; i++) {
@@ -426,46 +373,8 @@ public final class SyncWasm {
                 RuntimeWasm.section(11, data));
     }
 
-    /**
-     * Emits one import, routed to its owner's module: ABI 3 splits the namespaces, so the
-     * declared module name is not a property of the emitter but of who implements the name.
-     */
     private static void imp(Buf imports, String name, int typeIndex) {
-        String module = PLUGIN_IMPORTS.contains(name)
-                ? RuntimeWasm.PLUGIN_MODULE
-                : RuntimeWasm.ENGINE_MODULE;
-        imports.name(module).name(name).raw(0x00).uleb(typeIndex);
-    }
-
-    /**
-     * The imports above that the <em>engine</em> does not own — Billboard's entity and effect
-     * calls. They are emitted unconditionally (the import indices are constants the tests
-     * address by), so an engine-only run still has to bind something to them; see
-     * {@link #stubPluginImports()}. Drift is self-detecting: a name missing from this list
-     * fails instantiation with "missing host import".
-     */
-    private static final List<String> PLUGIN_IMPORTS = List.of(
-            "spawn_item_display", "spawn_text_display", "spawn_armor_stand", "spawn_item",
-            "set_item", "get_item_len", "get_item", "set_display_context", "get_display_context",
-            "set_billboard_mode", "get_billboard_mode", "set_text", "get_text_len", "get_text",
-            "set_text_background", "get_text_background", "set_text_opacity", "get_text_opacity",
-            "set_line_width", "get_line_width", "set_text_flags", "get_text_flags",
-            "set_pose", "get_pose", "set_equipment", "set_stand_flags", "get_stand_flags",
-            "set_yaw", "get_yaw", "play_sound", "emit_particle", "emit_particle_dust",
-            "emit_particle_dust_transition", "emit_particle_block", "emit_particle_item",
-            "spawn_block_display", "set_block", "set_position", "set_rotation", "set_scale",
-            "despawn", "get_position", "get_block_len", "get_block");
-
-    /**
-     * No-op bindings for every plugin-owned import, so an engine test can instantiate these
-     * modules without an embedder. Each returns {@code 0}; engine tests never call them.
-     */
-    public static Map<String, Map<String, HostFunction>> stubPluginImports() {
-        Map<String, HostFunction> functions = new HashMap<>();
-        for (String name : PLUGIN_IMPORTS) {
-            functions.put(name, (ctx, args) -> 0L);
-        }
-        return Map.of(RuntimeWasm.PLUGIN_MODULE, functions);
+        imports.name(RuntimeWasm.ENGINE_MODULE).name(name).raw(0x00).uleb(typeIndex);
     }
 
     private static Buf body(Buf localsDecl, Buf instructions) {

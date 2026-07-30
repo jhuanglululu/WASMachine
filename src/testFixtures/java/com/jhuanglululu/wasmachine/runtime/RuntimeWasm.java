@@ -23,9 +23,6 @@ public final class RuntimeWasm {
      */
     public static final String ENGINE_MODULE = "engine";
 
-    /** The stand-in plugin module these fixtures use for imports the engine does not own. */
-    public static final String PLUGIN_MODULE = "billboard";
-
     public static final class Buf {
         private final ByteArrayOutputStream o = new ByteArrayOutputStream();
 

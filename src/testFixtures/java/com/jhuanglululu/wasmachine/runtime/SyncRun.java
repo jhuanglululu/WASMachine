@@ -6,6 +6,7 @@ import com.jhuanglululu.wasm.Module;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * Drives a {@link SyncWasm} module to its end and collects its log trace.
@@ -63,7 +64,7 @@ public final class SyncRun {
         MachineInstance instance = new MachineInstance(Module.parse(SyncWasm.module(main)),
                 new MachineInstance.Config(NAME, RuntimeWasm.ENGINE_MODULE, ENTRY,
                         List.of(ENGINE_ABI), memoryCap, seed),
-                (name, message) -> logs.add(message), SyncWasm.stubPluginImports());
+                (name, message) -> logs.add(message), Map.of());
         return drive((tick, fuel) -> outcomeOf(instance.tick(tick, fuel)), logs, maxTicks, budget);
     }
 
