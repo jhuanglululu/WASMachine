@@ -11,4 +11,4 @@ halves of the ABI contract version together. Reference embedder:
 [`Billboard`](https://github.com/jhuanglululu/Billboard).
 
 Personal-use library: versioned by git, no publishing pipeline; consumed
-locally via Gradle composite build.
+as a Gradle source dependency on this repo (tracking `main`).
