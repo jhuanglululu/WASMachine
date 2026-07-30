@@ -774,7 +774,7 @@ public final class MachineInstance {
         return m;
     }
 
-    /** ABI v2 sync imports. Every one of these kills the instance on a bad id or kind. */
+    /** The engine sync imports. Every one of these kills the instance on a bad id or kind. */
     private void addSyncImports(Map<String, HostFunction> m, String engine) {
         m.put(engine + ".signal_new", (ctx, a) -> sync.newSignal());
         m.put(engine + ".signal_notify", (ctx, a) -> {
@@ -812,7 +812,7 @@ public final class MachineInstance {
         });
     }
 
-    /** ABI v2 random imports: one non-deterministic stream, one seeded per-instance stream. */
+    /** The engine random imports: one non-deterministic stream, one seeded per-instance stream. */
     private void addRandomImports(Map<String, HostFunction> m, String engine) {
         m.put(engine + ".random_nondet", (ctx, a) -> {
             nonDeterministicDraws++;
