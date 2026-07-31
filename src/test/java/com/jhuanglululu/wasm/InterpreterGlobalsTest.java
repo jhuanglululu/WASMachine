@@ -4,7 +4,6 @@ import static com.jhuanglululu.wasm.TestModule.I32;
 import static com.jhuanglululu.wasm.TestModule.i32Const;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-import com.jhuanglululu.wasm.WasmBuilder.Buf;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 

@@ -1,10 +1,9 @@
 package com.jhuanglululu.wasmachine.runtime;
 
+import com.jhuanglululu.wasm.Buf;
 import com.jhuanglululu.wasm.ExecutionContext;
 import com.jhuanglululu.wasm.Instance;
 import com.jhuanglululu.wasm.Module;
-import java.io.ByteArrayOutputStream;
-import java.nio.charset.StandardCharsets;
 import java.util.Map;
 
 /**
@@ -22,82 +21,6 @@ public final class RuntimeWasm {
      * boundary is structural: the engine owns this one, a plugin owns its own.
      */
     public static final String ENGINE_MODULE = "engine";
-
-    public static final class Buf {
-        private final ByteArrayOutputStream o = new ByteArrayOutputStream();
-
-        public Buf u8(int b) {
-            o.write(b & 0xFF);
-            return this;
-        }
-
-        public Buf raw(int... bs) {
-            for (int b : bs) {
-                o.write(b & 0xFF);
-            }
-            return this;
-        }
-
-        public Buf bytes(byte[] a) {
-            o.writeBytes(a);
-            return this;
-        }
-
-        public Buf buf(Buf x) {
-            return bytes(x.toBytes());
-        }
-
-        public Buf uleb(long value) {
-            long v = value;
-            do {
-                int b = (int) (v & 0x7F);
-                v >>>= 7;
-                if (v != 0) {
-                    b |= 0x80;
-                }
-                o.write(b);
-            } while (v != 0);
-            return this;
-        }
-
-        public Buf sleb(long value) {
-            long v = value;
-            boolean more = true;
-            while (more) {
-                int b = (int) (v & 0x7F);
-                v >>= 7;
-                if ((v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0)) {
-                    more = false;
-                } else {
-                    b |= 0x80;
-                }
-                o.write(b);
-            }
-            return this;
-        }
-
-        public Buf f64(double d) {
-            long bits = Double.doubleToRawLongBits(d);
-            for (int i = 0; i < 8; i++) {
-                o.write((int) ((bits >>> (8 * i)) & 0xFF));
-            }
-            return this;
-        }
-
-        public Buf name(String s) {
-            byte[] u = s.getBytes(StandardCharsets.UTF_8);
-            uleb(u.length);
-            return bytes(u);
-        }
-
-        public Buf vec(int n) {
-            return uleb(n);
-        }
-
-        public byte[] toBytes() {
-            return o.toByteArray();
-        }
-    }
 
     public static Buf section(int id, Buf body) {
         byte[] b = body.toBytes();

@@ -1,6 +1,6 @@
 package com.jhuanglululu.wasmachine.runtime;
 
-import com.jhuanglululu.wasmachine.runtime.RuntimeWasm.Buf;
+import com.jhuanglululu.wasm.Buf;
 import java.util.ArrayList;
 import java.util.List;
 

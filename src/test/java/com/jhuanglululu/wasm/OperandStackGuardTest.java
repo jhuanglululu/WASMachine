@@ -2,7 +2,6 @@ package com.jhuanglululu.wasm;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-import com.jhuanglululu.wasm.WasmBuilder.Buf;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 

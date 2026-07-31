@@ -6,7 +6,6 @@ import static com.jhuanglululu.wasm.TestModule.i32Const;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 
-import com.jhuanglululu.wasm.WasmBuilder.Buf;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 

@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
-import com.jhuanglululu.wasm.WasmBuilder.Buf;
 import org.junit.jupiter.api.Test;
 
 /**

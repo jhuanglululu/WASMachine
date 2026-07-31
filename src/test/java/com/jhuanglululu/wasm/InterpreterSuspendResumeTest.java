@@ -7,7 +7,6 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 
-import com.jhuanglululu.wasm.WasmBuilder.Buf;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 

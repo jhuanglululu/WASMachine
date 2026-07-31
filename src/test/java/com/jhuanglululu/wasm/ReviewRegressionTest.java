@@ -5,7 +5,6 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import com.jhuanglululu.wasm.WasmBuilder.Buf;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 

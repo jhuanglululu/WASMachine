@@ -12,7 +12,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import com.jhuanglululu.wasm.WasmBuilder.Buf;
 import org.junit.jupiter.api.Test;
 
 /** Known-answer tests for numeric instructions, focused on the trap-edge semantics. */

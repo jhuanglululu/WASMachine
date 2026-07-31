@@ -2,7 +2,6 @@ package com.jhuanglululu.wasm;
 
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 
-import com.jhuanglululu.wasm.WasmBuilder.Buf;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
