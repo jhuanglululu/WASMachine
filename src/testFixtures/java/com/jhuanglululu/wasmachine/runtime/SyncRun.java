@@ -20,7 +20,7 @@ public final class SyncRun {
 
     private SyncRun() {}
 
-    /** The instance name and handshake every fixture run uses (the ABI 3 engine names). */
+    /** The instance name and handshake every fixture run uses (the engine names from guest-abi.md). */
     private static final String NAME = "sync";
     private static final String ENTRY = "_engine_main";
     private static final String ABI = "_engine_abi";

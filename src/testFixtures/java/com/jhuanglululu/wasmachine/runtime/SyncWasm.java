@@ -15,8 +15,8 @@ import java.util.List;
  * from byte 64 up, and a {@code _engine_main} body supplied by the test through {@link P}.
  * {@code _engine_abi} returns {@link MachineInstance#ENGINE_ABI_VERSION}.
  *
- * <p>The engine does not know any embedder's vocabulary — ABI 3 made that boundary
- * structural. An embedder whose own imports are under test appends them through a
+ * <p>The engine does not know any embedder's vocabulary — the namespace split made that
+ * boundary structural. An embedder whose own imports are under test appends them through a
  * {@link Surface}: its imports land after the engine's in the one import table, declared
  * against the embedder's module, and its handshake export is emitted beside the engine's.
  */

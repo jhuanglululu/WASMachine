@@ -17,8 +17,8 @@ public final class RuntimeWasm {
     private RuntimeWasm() {}
 
     /**
-     * The engine's own import module. ABI 3 split the namespaces (see guest-abi.md) so the
-     * boundary is structural: the engine owns this one, a plugin owns its own.
+     * The engine's own import module. The namespace split (see guest-abi.md) made the
+     * boundary structural: the engine owns this one, a plugin owns its own.
      */
     public static final String ENGINE_MODULE = "engine";
 
