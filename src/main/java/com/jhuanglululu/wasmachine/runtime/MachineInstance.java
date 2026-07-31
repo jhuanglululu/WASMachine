@@ -182,6 +182,9 @@ public final class MachineInstance {
      *
      * @param ticksCaptured   samples taken ({@code 0} is possible: the instance may have died
      *                        before its first tick in the window)
+     * @param activeTicks     captured ticks in which at least one task actually executed
+     *                        (instructions were spent). A tick is counted once however many tasks
+     *                        ran in it; a tick every task slept through is captured but not active
      * @param complete        whether the window ran to the length it was armed for; {@code false}
      *                        means the instance ended first and this covers what was seen
      * @param instructionsMin cheapest tick in the window ({@code 0} if nothing was captured)
@@ -193,7 +196,7 @@ public final class MachineInstance {
      *                        which is the price of holding no standing watermark
      */
     public record CaptureSummary(
-            long ticksCaptured, boolean complete,
+            long ticksCaptured, long activeTicks, boolean complete,
             long instructionsMin, long instructionsMax, long instructionsSum,
             long memorySumBytes, long memoryPeakBytes) {
 
@@ -212,6 +215,7 @@ public final class MachineInstance {
     private static final class Capture {
         long remainingTicks;
         long ticksCaptured;
+        long activeTicks;
         long instructionsMin = Long.MAX_VALUE;
         long instructionsMax;
         long instructionsSum;
@@ -225,6 +229,9 @@ public final class MachineInstance {
         void sample(long instructions, long memoryUsed) {
             ticksCaptured++;
             remainingTicks--;
+            if (instructions > 0) {
+                activeTicks++;
+            }
             instructionsMin = Math.min(instructionsMin, instructions);
             instructionsMax = Math.max(instructionsMax, instructions);
             instructionsSum += instructions;
@@ -233,7 +240,7 @@ public final class MachineInstance {
         }
 
         CaptureSummary summarize(boolean complete) {
-            return new CaptureSummary(ticksCaptured, complete,
+            return new CaptureSummary(ticksCaptured, activeTicks, complete,
                     ticksCaptured == 0 ? 0 : instructionsMin, instructionsMax, instructionsSum,
                     memorySum, memoryPeak);
         }
