@@ -1,19 +1,34 @@
 package com.jhuanglululu.wasmachine.runtime;
 
 import com.jhuanglululu.wasm.Buf;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
+import java.util.IdentityHashMap;
 import java.util.List;
 
 /**
- * Hand-rolled WebAssembly modules for the engine imports — tasks, sync, random and the math
- * kernel. Like {@link RuntimeWasm} it writes section framing by hand, so the tests exercise
+ * Hand-rolled WebAssembly modules for the engine imports — tasks, sync, random, environ and the
+ * math kernel. Like {@link RuntimeWasm} it writes section framing by hand, so the tests exercise
  * the real interpreter and the real host-import path rather than a stand-in for them.
  *
  * <p>Every module has the same shape: one import table (indices are the {@code *} constants
  * below), a 1-page memory whose first 26 bytes are {@code "ABC…Z"} (so {@code log(i, 1)}
  * prints the {@code i}-th letter and {@code channel_send(ch, i, 1)} sends it), scratch space
- * from byte 64 up, and a {@code _engine_main} body supplied by the test through {@link P}.
- * {@code _engine_abi} returns {@link MachineInstance#ENGINE_ABI_VERSION}.
+ * from byte 64 up, a function table holding the spawnable task bodies, an exported mutable
+ * {@code __stack_pointer} (engine ABI 2 requires it), and a {@code _engine_main} body supplied
+ * by the test through {@link P}. {@code _engine_abi} returns
+ * {@link MachineInstance#ENGINE_ABI_VERSION}.
+ *
+ * <p><b>Tasks.</b> Since ABI 2 a child is not a copy of its parent: it is a separate function,
+ * entered as {@code fn(i32)} through the function table, with its own stack and its own locals.
+ * So {@link P#child(int, P)} takes the local whose value should be handed to the child as its
+ * argument — the child reads it as local 0 — and anything else a child needs travels through
+ * the (now shared) linear memory, via {@link P#store} / {@link P#load}. Table indices are
+ * allocated when the module is built, not when the body is written, so a child registered inside
+ * a nested {@link P} still gets the right index: {@link P#child} emits a one-byte placeholder
+ * and records its offset for patching (which is also why a fixture may declare at most
+ * {@value #MAX_TASKS} task bodies).
  *
  * <p>The engine does not know any embedder's vocabulary — the namespace split made that
  * boundary structural. An embedder whose own imports are under test appends them through a
@@ -26,7 +41,7 @@ public final class SyncWasm {
 
     // Import indices, in declaration order (what `call` takes).
     public static final int LOG = 0;
-    public static final int FORK = 1;
+    public static final int SPAWN = 1;
     public static final int SLEEP = 2;
     public static final int EXIT = 3;
     public static final int JOIN = 4;
@@ -63,22 +78,46 @@ public final class SyncWasm {
     public static final int ACOS = 34;
     public static final int ATAN2 = 35;
     public static final int FORMAT_F64 = 36;
+    public static final int ENVIRON_LEN = 37;
+    public static final int ENVIRON_READ = 38;
 
     /** Where a {@link Surface}'s imports start: the engine's own end at this index. */
-    public static final int ENGINE_IMPORT_COUNT = 37;
+    public static final int ENGINE_IMPORT_COUNT = 39;
 
     private static final int ENGINE_TYPE_COUNT = 13;
+
+    /** Type index of the task-entry signature {@code (i32) -> ()}. */
+    private static final int TASK_TYPE = 4;
 
     /** Scratch address for received channel payloads (well clear of the letter table). */
     public static final int SCRATCH = 64;
 
     /**
-     * An instruction-sequence builder. Locals 0..7 are {@code i32} and 8..9 are {@code i64};
-     * the body's trailing {@code i32.const 0} + {@code end} is added by {@link #module}.
+     * Scratch address for values passed between tasks. Where a fork-era fixture relied on the
+     * child inheriting the parent's locals, an ABI-2 fixture puts the value here and the child
+     * reads it out of the shared memory.
+     */
+    public static final int VARS = 128;
+
+    /** Global index of the exported mutable {@code __stack_pointer}. */
+    public static final int STACK_POINTER_GLOBAL = 1;
+
+    /** A task index has to fit a one-byte {@code i32.const} placeholder. */
+    public static final int MAX_TASKS = 63;
+
+    /**
+     * An instruction-sequence builder. In {@code _engine_main}, locals 0..7 are {@code i32} and
+     * 8..9 are {@code i64}. In a task body, local 0 is the {@code i32} the spawner passed as
+     * {@code data}, locals 1..8 are {@code i32} scratch and 9..10 are {@code i64}. The body's
+     * trailing {@code end} (and, for main, {@code i32.const 0}) is added by {@link #module}.
      */
     public static final class P {
 
+        /** A one-byte table index placeholder to patch once indices are assigned. */
+        private record Fix(int offset, P task) {}
+
         private final Buf b = new Buf();
+        private final List<Fix> fixes = new ArrayList<>();
 
         public P raw(int... bytes) {
             b.raw(bytes);
@@ -121,6 +160,58 @@ public final class SyncWasm {
             return raw(0x1A);
         }
 
+        /** {@code global.get} */
+        public P globalGet(int index) {
+            b.raw(0x23).uleb(index);
+            return this;
+        }
+
+        /** {@code global.set} */
+        public P globalSet(int index) {
+            b.raw(0x24).uleb(index);
+            return this;
+        }
+
+        /** {@code i32.store} of {@code local} at the constant address {@code addr}. */
+        public P store(int addr, int local) {
+            return i32(addr).get(local).raw(0x36, 0x02, 0x00);
+        }
+
+        /** {@code i32.store} of the value on top of the stack, at the address below it. */
+        public P storeTop() {
+            return raw(0x36, 0x02, 0x00);
+        }
+
+        /** {@code i32.load} from the constant address {@code addr}. */
+        public P load(int addr) {
+            return i32(addr).raw(0x28, 0x02, 0x00);
+        }
+
+        /** {@code i32.load} from the address on top of the stack. */
+        public P loadTop() {
+            return raw(0x28, 0x02, 0x00);
+        }
+
+        /** {@code memory.size} in pages. */
+        public P memorySize() {
+            return raw(0x3F, 0x00);
+        }
+
+        /** {@code memory.grow} by the page count on top of the stack. */
+        public P memoryGrow() {
+            return raw(0x40, 0x00);
+        }
+
+        /** {@code i32.add} */
+        public P add() {
+            return raw(0x6A);
+        }
+
+        /** {@code i32.sub} */
+        public P sub() {
+            return raw(0x6B);
+        }
+
         /** Logs the {@code index}-th letter of the alphabet. */
         public P log(int index) {
             return i32(index).i32(1).call(LOG);
@@ -137,7 +228,9 @@ public final class SyncWasm {
 
         /** {@code if (top == 0) { body }} */
         public P ifZero(P body) {
-            b.raw(0x45, 0x04, 0x40).buf(body.b).raw(0x0B);
+            b.raw(0x45, 0x04, 0x40);
+            merge(body);
+            b.raw(0x0B);
             return this;
         }
 
@@ -150,21 +243,24 @@ public final class SyncWasm {
         /** {@code if (top == value) { body }} */
         public P ifEq(int value, P body) {
             i32(value).raw(0x46, 0x04, 0x40);
-            b.buf(body.b).raw(0x0B);
+            merge(body);
+            b.raw(0x0B);
             return this;
         }
 
         /** {@code if (top == value) { body }} for an i64 on the stack. */
         public P ifEqI64(long value, P body) {
             i64(value).raw(0x51, 0x04, 0x40);
-            b.buf(body.b).raw(0x0B);
+            merge(body);
+            b.raw(0x0B);
             return this;
         }
 
         /** {@code if (top == value) { body }} for an f64 on the stack. */
         public P ifEqF64(double value, P body) {
             f64(value).raw(0x61, 0x04, 0x40);
-            b.buf(body.b).raw(0x0B);
+            merge(body);
+            b.raw(0x0B);
             return this;
         }
 
@@ -175,18 +271,39 @@ public final class SyncWasm {
 
         /** Appends another sequence. */
         public P append(P other) {
-            b.buf(other.b);
+            merge(other);
             return this;
         }
 
-        /** Forks a child that runs {@code body} then exits; the parent falls through. */
+        /** Spawns a task running {@code body} with argument {@code 0}; drops the task id. */
         public P child(P body) {
-            return call(FORK).ifZero(new P().append(body).call(EXIT));
+            return childWithData(0, body).drop();
         }
 
-        /** Like {@link #child} but also stores the child's task id in {@code idLocal}. */
-        public P childWithId(int idLocal, P body) {
-            return call(FORK).tee(idLocal).ifZero(new P().append(body).call(EXIT));
+        /**
+         * Spawns a task running {@code body}, handing it {@code dataLocal}'s current value —
+         * which the body reads as its own local 0. Drops the task id.
+         */
+        public P child(int dataLocal, P body) {
+            return taskIndex(body).get(dataLocal).call(SPAWN).drop();
+        }
+
+        /** {@link #child(int, P)}, but stores the new task's id in {@code idLocal}. */
+        public P childWithId(int idLocal, int dataLocal, P body) {
+            return taskIndex(body).get(dataLocal).call(SPAWN).set(idLocal);
+        }
+
+        /** Spawns a task running {@code body} with the constant argument {@code data}. */
+        public P childWithData(int data, P body) {
+            return taskIndex(body).i32(data).call(SPAWN);
+        }
+
+        /**
+         * A raw {@code spawn} with a literal table index — for the tests that hand the engine
+         * an index no task was ever registered at.
+         */
+        public P spawnRaw(int entry, int data) {
+            return i32(entry).i32(data).call(SPAWN);
         }
 
         /**
@@ -202,6 +319,32 @@ public final class SyncWasm {
         /** Sends {@code len} bytes of the letter table starting at letter {@code index}. */
         public P send(int channelLocal, int index, int len) {
             return get(channelLocal).i32(index).i32(len).call(CHANNEL_SEND);
+        }
+
+        /** Emits {@code i32.const <table index of task>}, patched when the module is built. */
+        private P taskIndex(P task) {
+            b.raw(0x41);
+            fixes.add(new Fix(b.size(), task));
+            b.raw(0x00); // placeholder: one byte, so patching never shifts anything
+            return this;
+        }
+
+        /** Splices {@code other}'s bytes in, rebasing its pending patch offsets. */
+        private void merge(P other) {
+            int base = b.size();
+            for (Fix f : other.fixes) {
+                fixes.add(new Fix(f.offset() + base, f.task()));
+            }
+            b.buf(other.b);
+        }
+
+        /** This sequence's bytes with every task index patched in. */
+        private byte[] resolved(IdentityHashMap<P, Integer> indices) {
+            byte[] bytes = b.toBytes();
+            for (Fix f : fixes) {
+                bytes[f.offset()] = indices.get(f.task()).byteValue();
+            }
+            return bytes;
         }
     }
 
@@ -267,13 +410,19 @@ public final class SyncWasm {
 
     /** Wraps {@code main} into a module reporting each handshake version explicitly. */
     public static byte[] module(P main, int abiVersion, Surface surface, int surfaceAbiVersion) {
+        List<P> tasks = collectTasks(main);
+        IdentityHashMap<P, Integer> taskIndices = new IdentityHashMap<>();
+        for (int i = 0; i < tasks.size(); i++) {
+            taskIndices.put(tasks.get(i), i);
+        }
+
         int surfaceTypes = surface == null ? 0 : surface.types.size();
         Buf types = new Buf().vec(ENGINE_TYPE_COUNT + surfaceTypes)
                 .raw(0x60, 0x02, 0x7F, 0x7F, 0x00)       // 0 (i32,i32)->()
                 .raw(0x60, 0x00, 0x01, 0x7F)             // 1 ()->(i32)
                 .raw(0x60, 0x01, 0x7E, 0x00)             // 2 (i64)->()
                 .raw(0x60, 0x00, 0x00)                   // 3 ()->()
-                .raw(0x60, 0x01, 0x7F, 0x00)             // 4 (i32)->()
+                .raw(0x60, 0x01, 0x7F, 0x00)             // 4 (i32)->()  — also the task entry
                 .raw(0x60, 0x01, 0x7F, 0x01, 0x7F)       // 5 (i32)->(i32)
                 .raw(0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F) // 6 (i32,i32)->(i32)
                 .raw(0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x00) // 7 (i32,i32,i32)->()
@@ -293,7 +442,7 @@ public final class SyncWasm {
         int importCount = ENGINE_IMPORT_COUNT + surfaceImports;
         Buf imports = new Buf().vec(importCount);
         imp(imports, "log", 0);
-        imp(imports, "fork", 1);
+        imp(imports, "spawn", 6);
         imp(imports, "sleep", 2);
         imp(imports, "exit", 3);
         imp(imports, "join", 4);
@@ -329,6 +478,8 @@ public final class SyncWasm {
         imp(imports, "acos", 10);
         imp(imports, "atan2", 11);
         imp(imports, "format_f64", 12);
+        imp(imports, "environ_len", 1);
+        imp(imports, "environ_read", 4);
         if (surface != null) {
             for (int i = 0; i < surface.names.size(); i++) {
                 imports.name(surface.module).name(surface.names.get(i))
@@ -336,29 +487,46 @@ public final class SyncWasm {
             }
         }
 
-        // main and the engine handshake — plus the surface handshake — all ()->(i32).
-        int bodyCount = surface == null ? 2 : 3;
-        Buf funcs = new Buf().vec(bodyCount);
-        for (int i = 0; i < bodyCount; i++) {
+        // main and the engine handshake — plus the surface handshake — are all ()->(i32); the
+        // task bodies that follow them are (i32)->().
+        int fixedBodies = surface == null ? 2 : 3;
+        Buf funcs = new Buf().vec(fixedBodies + tasks.size());
+        for (int i = 0; i < fixedBodies; i++) {
             funcs.uleb(1);
         }
+        for (int i = 0; i < tasks.size(); i++) {
+            funcs.uleb(TASK_TYPE);
+        }
+
+        // One extra table slot past the registered tasks, deliberately left null, so a test can
+        // spawn a null element without having to guess an index.
+        Buf table = new Buf().vec(1).raw(0x70, 0x00).uleb(tasks.size() + 1);
         Buf memory = new Buf().vec(1).raw(0x00).uleb(1);
-        Buf globals = RuntimeWasm.section(6,
-                new Buf().vec(1).raw(0x7F, 0x00).raw(0x41).sleb(1024).raw(0x0B));
-        Buf exports = new Buf().vec(bodyCount + 1)
+        Buf globals = RuntimeWasm.section(6, new Buf().vec(2)
+                .raw(0x7F, 0x00).raw(0x41).sleb(1024).raw(0x0B)   // 0: __heap_base (immutable)
+                .raw(0x7F, 0x01).raw(0x41).sleb(1024).raw(0x0B)); // 1: __stack_pointer (mutable)
+        Buf exports = new Buf().vec(fixedBodies + 2)
                 .name("_engine_main").raw(0x00).uleb(importCount)
                 .name("_engine_abi").raw(0x00).uleb(importCount + 1);
         if (surface != null) {
             exports.name(surface.abiExport).raw(0x00).uleb(importCount + 2);
         }
         exports.name("__heap_base").raw(0x03).uleb(0);
-        Buf locals = new Buf().vec(2).uleb(8).raw(0x7F).uleb(2).raw(0x7E);
-        Buf mainBody = body(locals, new Buf().buf(main.b).raw(0x41, 0x00, 0x0B));
+        exports.name("__stack_pointer").raw(0x03).uleb(STACK_POINTER_GLOBAL);
+
+        Buf mainLocals = new Buf().vec(2).uleb(8).raw(0x7F).uleb(2).raw(0x7E);
+        // A task body's local 0 is its i32 parameter, so its scratch locals start at 1.
+        Buf taskLocals = new Buf().vec(2).uleb(8).raw(0x7F).uleb(2).raw(0x7E);
+        Buf mainBody = body(mainLocals,
+                new Buf().bytes(main.resolved(taskIndices)).raw(0x41, 0x00, 0x0B));
         Buf abiBody = body(new Buf().vec(0), new Buf().raw(0x41).sleb(abiVersion).raw(0x0B));
-        Buf code = new Buf().vec(bodyCount).buf(mainBody).buf(abiBody);
+        Buf code = new Buf().vec(fixedBodies + tasks.size()).buf(mainBody).buf(abiBody);
         if (surface != null) {
             code.buf(body(new Buf().vec(0),
                     new Buf().raw(0x41).sleb(surfaceAbiVersion).raw(0x0B)));
+        }
+        for (P task : tasks) {
+            code.buf(body(taskLocals, new Buf().bytes(task.resolved(taskIndices)).raw(0x0B)));
         }
 
         byte[] letters = new byte[26];
@@ -367,10 +535,41 @@ public final class SyncWasm {
         }
         Buf data = new Buf().vec(1).uleb(0).raw(0x41, 0x00, 0x0B).uleb(letters.length).bytes(letters);
 
-        return RuntimeWasm.module(RuntimeWasm.section(1, types), RuntimeWasm.section(2, imports),
-                RuntimeWasm.section(3, funcs), RuntimeWasm.section(5, memory), globals,
-                RuntimeWasm.section(7, exports), RuntimeWasm.section(10, code),
-                RuntimeWasm.section(11, data));
+        List<Buf> sections = new ArrayList<>(List.of(
+                RuntimeWasm.section(1, types), RuntimeWasm.section(2, imports),
+                RuntimeWasm.section(3, funcs), RuntimeWasm.section(4, table),
+                RuntimeWasm.section(5, memory), globals, RuntimeWasm.section(7, exports)));
+        if (!tasks.isEmpty()) {
+            Buf elemBody = new Buf().vec(1).uleb(0).raw(0x41, 0x00, 0x0B).vec(tasks.size());
+            for (int i = 0; i < tasks.size(); i++) {
+                elemBody.uleb(importCount + fixedBodies + i);
+            }
+            sections.add(RuntimeWasm.section(9, elemBody));
+        }
+        sections.add(RuntimeWasm.section(10, code));
+        sections.add(RuntimeWasm.section(11, data));
+        return RuntimeWasm.module(sections.toArray(new Buf[0]));
+    }
+
+    /** Every task body reachable from {@code main}, in the order the table lists them. */
+    private static List<P> collectTasks(P main) {
+        List<P> ordered = new ArrayList<>();
+        IdentityHashMap<P, Boolean> seen = new IdentityHashMap<>();
+        Deque<P> pending = new ArrayDeque<>();
+        pending.add(main);
+        while (!pending.isEmpty()) {
+            for (P.Fix fix : pending.remove().fixes) {
+                if (seen.put(fix.task(), Boolean.TRUE) == null) {
+                    ordered.add(fix.task());
+                    pending.add(fix.task());
+                }
+            }
+        }
+        if (ordered.size() > MAX_TASKS) {
+            throw new IllegalArgumentException(
+                    "a fixture may declare at most " + MAX_TASKS + " task bodies");
+        }
+        return ordered;
     }
 
     private static void imp(Buf imports, String name, int typeIndex) {

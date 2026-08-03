@@ -30,8 +30,8 @@ class SyncChannelTest {
         // though they resume in spawn order, which is why each release must reserve its message.
         P main = new P()
                 .i32(4).call(CHANNEL_NEW).set(0)
-                .child(new P().sleep(1).recvAndLog(0, 1, SCRATCH))
-                .child(new P().recvAndLog(0, 1, SCRATCH + 8))
+                .child(0, new P().sleep(1).recvAndLog(0, 1, SCRATCH))
+                .child(0, new P().recvAndLog(0, 1, SCRATCH + 8))
                 .sleep(2)
                 .send(0, 0, 1)
                 .send(0, 1, 1)
@@ -47,7 +47,7 @@ class SyncChannelTest {
         // tick 3 frees the slot.
         P main = new P()
                 .i32(1).call(CHANNEL_NEW).set(0)
-                .child(new P().sleep(3).recvAndLog(0, 1, SCRATCH))
+                .child(0, new P().sleep(3).recvAndLog(0, 1, SCRATCH))
                 .send(0, 0, 1)
                 .send(0, 1, 1)
                 .log(Z)
@@ -94,7 +94,7 @@ class SyncChannelTest {
         P main = new P()
                 .i32(1).call(CHANNEL_NEW).set(0)
                 .send(0, 0, 1)
-                .child(new P().send(0, 1, 2).log(B))
+                .child(0, new P().send(0, 1, 2).log(B))
                 .sleep(1)
                 .get(0).call(CHANNEL_CLEAR)
                 .recvAndLog(0, 1, SCRATCH)

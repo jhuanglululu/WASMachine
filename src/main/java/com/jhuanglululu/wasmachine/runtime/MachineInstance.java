@@ -4,10 +4,15 @@ import com.jhuanglululu.wasm.ExecResult;
 import com.jhuanglululu.wasm.ExecutionContext;
 import com.jhuanglululu.wasm.Export;
 import com.jhuanglululu.wasm.ExternalKind;
+import com.jhuanglululu.wasm.FuncType;
+import com.jhuanglululu.wasm.GlobalType;
 import com.jhuanglululu.wasm.HostFunction;
 import com.jhuanglululu.wasm.Instance;
 import com.jhuanglululu.wasm.Module;
+import com.jhuanglululu.wasm.ValType;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -18,17 +23,17 @@ import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * One running guest: it owns the WASM {@link Instance}, the cooperative tasks that run on it
- * (each an {@link ExecutionContext} with its own memory + {@link HostAllocator}, a wake
- * condition, and a spawn-order index), the {@link SyncTable}, the shared {@link MemoryBudget}
- * and the two random streams. It implements every engine-owned ABI import (realloc, fork, join,
- * kill, exit, sleep, log, fail, sync, random and the {@link MathKernel}), registers the
- * embedder's own import modules next to them, and drives execution one game tick at a time via
- * {@link #tick}.
+ * (each an {@link ExecutionContext} sharing the instance's one linear memory, with a wake
+ * condition and a spawn-order index), the single {@link HostAllocator}, the {@link SyncTable},
+ * the shared {@link MemoryBudget} and the two random streams. It implements every engine-owned
+ * ABI import (realloc, spawn, join, kill, exit, sleep, log, fail, environ, sync, random and the
+ * {@link MathKernel}), registers the embedder's own import modules next to them, and drives
+ * execution one game tick at a time via {@link #tick}.
  *
  * <p><b>Scheduling.</b> Each tick, every due task runs (to its next blocking point) in
  * <em>spawn order</em>, sharing one instruction budget. A task blocks at {@code sleep}
  * (wakes at {@code currentTick + ticks}) or {@code join} (wakes when its target ends).
- * A forked child becomes runnable immediately and runs the same tick, after the parent
+ * A spawned child becomes runnable immediately and runs the same tick, after the parent
  * yields. Task 0's entry export returning ends the whole instance; any other task
  * returning or calling {@code exit} just ends that task.
  *
@@ -41,9 +46,18 @@ import java.util.concurrent.ThreadLocalRandom;
  *   <li><b>Shared budget.</b> The per-tick budget is spent across all tasks in the order
  *       they run; if any task cannot reach a blocking point before it is exhausted, the
  *       whole instance errors (this is the runaway-loop guard).</li>
- *   <li><b>Fork ids.</b> {@code fork} returns the child's task id in the parent and
- *       {@code 0} in the child (Linux semantics). The child is a deep copy of the parent
- *       taken at the fork suspension, resumed with {@code 0}.</li>
+ *   <li><b>Shared memory, private stacks.</b> All tasks read and write one
+ *       {@link com.jhuanglululu.wasm.LinearMemory} and one heap, so a pointer means the same
+ *       thing everywhere. What must not be shared is the wasm shadow stack: {@code spawn}
+ *       allocates the child a stack region out of the heap
+ *       ({@link Config#taskStackBytes()}, default {@value Config#DEFAULT_TASK_STACK_BYTES}
+ *       bytes) and points the child's own copy of the {@code __stack_pointer} global at its
+ *       top. That region — and only it — is freed when the task ends.</li>
+ *   <li><b>{@code spawn} does not yield.</b> It returns the new task id to the spawner
+ *       inline, so a guest can spawn several children in one turn; each child is queued
+ *       {@code RUNNABLE} and takes its first turn later in the same tick, after the spawner
+ *       reaches its next blocking point. Nothing in the child can run before that, which is
+ *       what makes the inline return safe.</li>
  *   <li><b>Releases land in the next round.</b> A tick runs tasks in rounds: each round
  *       gives every due task one turn in spawn order. A task released by a sync operation
  *       (see {@link SyncTable}) is deliberately held back from the round that released it,
@@ -67,7 +81,7 @@ public final class MachineInstance {
      * older guest simply never imports the new name; semantic changes do. Plugin modules version
      * independently through their own handshake export.
      */
-    public static final int ENGINE_ABI_VERSION = 1;
+    public static final int ENGINE_ABI_VERSION = 2;
 
     /**
      * One load-time handshake: {@code export} is invoked with no arguments and must return an
@@ -83,48 +97,73 @@ public final class MachineInstance {
      * @param engineModule   the import module name the engine registers its own functions under
      * @param entryExport    the exported function task 0 runs (no arguments, one {@code i32})
      * @param abiChecks      the handshake exports validated at construction
-     * @param memoryCapBytes the per-instance memory cap: one allowance shared by every task's
-     *                       heap and by the channel buffers (see {@link MemoryBudget})
+     * @param memoryCapBytes the per-instance memory cap: one allowance shared by the guest heap
+     *                       and by the channel buffers (see {@link MemoryBudget})
      * @param instanceSeed   seeds this instance's deterministic random stream
+     * @param environ        the read-only key/value strings the guest can read back through
+     *                       {@code environ_len}/{@code environ_read}. Immutable for the whole
+     *                       run by design — an embedder that wants a guest to see new values
+     *                       restarts the instance, so a guest never has to reason about
+     *                       environ changing under it
+     * @param taskStackBytes how large a stack region {@code spawn} allocates for a new task,
+     *                       out of the shared heap and against the same memory cap. Task 0
+     *                       does not get one: it runs on the stack the linker gave the module
      */
     public record Config(String name, String engineModule, String entryExport,
-            List<AbiCheck> abiChecks, long memoryCapBytes, long instanceSeed) {
+            List<AbiCheck> abiChecks, long memoryCapBytes, long instanceSeed,
+            Map<String, String> environ, int taskStackBytes) {
+
+        /** The default per-task stack: 64 KiB, the wasm-ld default main-stack size. */
+        public static final int DEFAULT_TASK_STACK_BYTES = 64 * 1024;
 
         public Config {
             abiChecks = List.copyOf(abiChecks);
+            environ = Map.copyOf(environ);
+            if (taskStackBytes <= 0) {
+                throw new IllegalArgumentException(
+                        "a task stack must be at least 1 byte, got " + taskStackBytes);
+            }
+        }
+
+        /** No environ and {@link #DEFAULT_TASK_STACK_BYTES} stacks. */
+        public Config(String name, String engineModule, String entryExport,
+                List<AbiCheck> abiChecks, long memoryCapBytes, long instanceSeed) {
+            this(name, engineModule, entryExport, abiChecks, memoryCapBytes, instanceSeed,
+                    Map.of(), DEFAULT_TASK_STACK_BYTES);
         }
     }
 
     private static final long[] NO_ARGS = new long[0];
+
+    /** The mutable {@code i32} global every ABI-2 guest exports so the host can re-stack tasks. */
+    public static final String STACK_POINTER_EXPORT = "__stack_pointer";
+
+    // wasm's C ABI wants a 16-byte-aligned stack pointer at a call boundary.
+    private static final int STACK_ALIGN = 16;
 
     // Splits the scheduling random stream off the instance seed (an arbitrary odd constant).
     private static final long SCHEDULING_STREAM_SALT = 0xD1B54A32D192ED03L;
 
     // Suspension request payloads a host import hands to the interpreter.
     private sealed interface Request
-            permits SleepRequest, JoinRequest, ForkRequest, ExitRequest, ParkRequest {}
+            permits SleepRequest, JoinRequest, ExitRequest, ParkRequest {}
 
     private record SleepRequest(long ticks) implements Request {}
 
     private record JoinRequest(int taskId) implements Request {}
-
-    private record ForkRequest() implements Request {}
 
     private record ExitRequest() implements Request {}
 
     /** Parked on a sync object; the {@link SyncTable} decides when (and with what) it resumes. */
     private record ParkRequest() implements Request {}
 
-    private static final ForkRequest FORK = new ForkRequest();
     private static final ExitRequest EXIT = new ExitRequest();
     private static final ParkRequest PARK = new ParkRequest();
 
     private enum TaskState {
         /** Task 0 before its entry export has been invoked. */
         NOT_STARTED,
-        /** A forked child awaiting its first resume (which returns {@code 0} from fork). */
-        FORK_PENDING,
-        /** Ready to run/continue now. */
+        /** Ready to run/continue now (a freshly spawned task starts here). */
         RUNNABLE,
         /** Parked until {@link Task#wakeTick}. */
         SLEEPING,
@@ -139,10 +178,13 @@ public final class MachineInstance {
     private static final class Task {
         final int id;
         ExecutionContext ctx;
-        HostAllocator allocator;
         TaskState state;
         long wakeTick;
         int joinTarget = -1;
+        // The heap block backing this task's wasm shadow stack, freed when it ends.
+        // Task 0 has none (stackPtr == 0): its stack is the one the linker laid out.
+        int stackPtr;
+        int stackBytes;
         // Set by the sync waker: the value the parked host call returns, and whether the
         // release happened before the park suspension was even recorded (same-turn release).
         long resumeValue;
@@ -163,14 +205,15 @@ public final class MachineInstance {
      * instance nobody is looking at should carry no measuring cost at all, so anything
      * per-tick lives in a {@link CaptureSummary} instead of a standing counter.
      *
-     * @param memoryUsedBytes bytes charged right now: guest heaps plus channel buffers
+     * @param memoryUsedBytes bytes charged right now: the shared guest heap (task stacks
+     *                        included, since they are heap blocks) plus the channel buffers
      * @param memoryCapBytes  the configured per-instance cap
      * @param liveTasks       tasks that have not finished, task 0 included
-     * @param totalForks      forks so far — free, since the task-id counter already implies it
+     * @param totalSpawns     spawns so far — free, since the task-id counter already implies it
      */
     public record StatsSnapshot(
             long memoryUsedBytes, long memoryCapBytes,
-            int liveTasks, int totalForks) {}
+            int liveTasks, int totalSpawns) {}
 
     /**
      * What a finished capture window saw. One sample is one whole {@link #tick} call, so
@@ -251,11 +294,18 @@ public final class MachineInstance {
 
     private final Instance wasm;
     private final SyncTable sync;
-    // One allowance for every guest heap and every channel buffer in this instance.
+    // One allowance for the guest heap and every channel buffer in this instance.
     private final MemoryBudget budget;
+    // One heap over the one shared linear memory: every task's realloc and every task's
+    // stack region comes out of this.
+    private final HostAllocator allocator;
+    // Index of the guest's exported mutable __stack_pointer global, set per spawned task.
+    private final int stackPointerGlobal;
+    // The environ blob, built once at construction (empty array = no environ).
+    private final byte[] environBlob;
     // The guest-facing deterministic random stream; seed_random restarts it.
     private final SplitMix64 deterministicRandom;
-    // In ascending spawn order: task 0 first, forked children appended as created.
+    // In ascending spawn order: task 0 first, spawned children appended as created.
     private final List<Task> tasks = new ArrayList<>();
     // Tasks a sync release woke during the current scheduling round: they wait for the next
     // one, so everything freed by a single release takes its turn in spawn order.
@@ -285,6 +335,10 @@ public final class MachineInstance {
      *
      * @param pluginImports the embedder's import modules: module name → function name → impl.
      *                      Engine-owned names in {@code config.engineModule()} win a collision.
+     * @throws IllegalArgumentException if the module is missing an export the engine requires
+     *     ({@code __heap_base}, or the mutable {@code __stack_pointer} every ABI-2 guest must
+     *     export). These are structural, not versioned, so they are thrown rather than
+     *     reported through {@link #loadError()} — there is no instance to ask.
      */
     public MachineInstance(Module module, Config config, LogSink logSink,
             Map<String, Map<String, HostFunction>> pluginImports) {
@@ -292,6 +346,7 @@ public final class MachineInstance {
         this.logSink = logSink;
         this.deterministicRandom = new SplitMix64(config.instanceSeed());
         this.budget = new MemoryBudget(config.memoryCapBytes());
+        this.environBlob = buildEnvironBlob(config.environ());
         // The scheduling stream is derived from the same seed but never shares state with the
         // guest-facing one, so cosmetic random() calls cannot reshuffle notify_one(Random).
         this.sync = new SyncTable(this::releaseTask,
@@ -300,10 +355,11 @@ public final class MachineInstance {
 
         ExecutionContext ctx0 = wasm.instantiate();
         int heapBase = exportedGlobalI32(module, ctx0, "__heap_base");
+        this.stackPointerGlobal = stackPointerGlobalIndex(module);
+        this.allocator = new HostAllocator(heapBase, budget);
 
         Task task0 = new Task(0);
         task0.ctx = ctx0;
-        task0.allocator = new HostAllocator(heapBase, budget);
         task0.state = TaskState.NOT_STARTED;
         task0.wakeTick = 0;
         tasks.add(task0);
@@ -351,6 +407,82 @@ public final class MachineInstance {
             }
         }
         throw new IllegalArgumentException("module has no exported global \"" + exportName + "\"");
+    }
+
+    /**
+     * Locates the guest's {@code __stack_pointer} global, which engine ABI 2 requires every
+     * guest to export mutably: it is the one piece of guest state the host must be able to
+     * write, because giving a spawned task its own shadow stack is exactly writing it.
+     *
+     * <p>Required unconditionally rather than only for modules that import {@code spawn}: a
+     * missing export is a build-flag mistake, and finding out at the first {@code spawn}
+     * — possibly minutes into an animation — would be a far worse failure than finding out
+     * at load. The message names the flag because that is the entire fix.
+     */
+    private static int stackPointerGlobalIndex(Module module) {
+        for (Export e : module.exports()) {
+            if (e.kind() == ExternalKind.GLOBAL && e.name().equals(STACK_POINTER_EXPORT)) {
+                GlobalType type = module.globals().get(e.index()).type();
+                if (type.valueType() != ValType.I32 || !type.mutable()) {
+                    throw new IllegalArgumentException("exported global \"" + STACK_POINTER_EXPORT
+                            + "\" must be a mutable i32 but is "
+                            + (type.mutable() ? "a mutable " : "an immutable ")
+                            + type.valueType());
+                }
+                return e.index();
+            }
+        }
+        throw new IllegalArgumentException("module has no exported global \""
+                + STACK_POINTER_EXPORT + "\", which engine ABI " + ENGINE_ABI_VERSION
+                + " requires so each task can be given its own stack; build the guest with"
+                + " -C link-arg=--export=" + STACK_POINTER_EXPORT);
+    }
+
+    /**
+     * Serializes the environ into the wire blob the guest reads: {@code u32} entry count,
+     * then per entry {@code u32 key_len, key, u32 value_len, value}, all little-endian, all
+     * strings UTF-8, entries in ascending order of their raw key bytes. An empty environ
+     * serializes to <em>nothing</em> (not to a zero count), so {@code environ_len() == 0} is
+     * the guest's whole emptiness test and it never has to read to find out.
+     *
+     * <p>Ordering by key bytes rather than by anything locale-aware keeps the blob identical
+     * on every machine, which a determinism-minded guest can rely on.
+     */
+    private static byte[] buildEnvironBlob(Map<String, String> environ) {
+        if (environ.isEmpty()) {
+            return new byte[0];
+        }
+        List<byte[][]> entries = new ArrayList<>(environ.size());
+        for (Map.Entry<String, String> e : environ.entrySet()) {
+            entries.add(new byte[][] {
+                    e.getKey().getBytes(StandardCharsets.UTF_8),
+                    e.getValue().getBytes(StandardCharsets.UTF_8)});
+        }
+        entries.sort((a, b) -> Arrays.compareUnsigned(a[0], b[0]));
+        int size = 4;
+        for (byte[][] e : entries) {
+            size += 4 + e[0].length + 4 + e[1].length;
+        }
+        byte[] blob = new byte[size];
+        int p = putU32(blob, 0, entries.size());
+        for (byte[][] e : entries) {
+            p = putBytes(blob, putU32(blob, p, e[0].length), e[0]);
+            p = putBytes(blob, putU32(blob, p, e[1].length), e[1]);
+        }
+        return blob;
+    }
+
+    private static int putU32(byte[] out, int at, int value) {
+        out[at] = (byte) value;
+        out[at + 1] = (byte) (value >>> 8);
+        out[at + 2] = (byte) (value >>> 16);
+        out[at + 3] = (byte) (value >>> 24);
+        return at + 4;
+    }
+
+    private static int putBytes(byte[] out, int at, byte[] src) {
+        System.arraycopy(src, 0, out, at, src.length);
+        return at + src.length;
     }
 
     /** The instance name. */
@@ -559,7 +691,7 @@ public final class MachineInstance {
 
     private boolean dueAt(Task t, long currentTick) {
         return switch (t.state) {
-            case NOT_STARTED, FORK_PENDING, RUNNABLE -> true;
+            case NOT_STARTED, RUNNABLE -> true;
             case PARKED -> false;
             case SLEEPING -> t.wakeTick <= currentTick;
             case JOINING -> {
@@ -571,53 +703,86 @@ public final class MachineInstance {
     }
 
     private TickResult runTurn(Task task, long currentTick) {
-        ExecResult result = startOrResume(task);
-        while (result instanceof ExecResult.Suspended s && s.request() instanceof ForkRequest) {
-            Task child = doFork(task, currentTick);
-            result = resumeWith(task, child.id);
-        }
-        return applyResult(task, result, currentTick);
+        return applyResult(task, startOrResume(task), currentTick);
     }
 
     private ExecResult startOrResume(Task task) {
         currentTask = task;
         ExecResult r;
-        switch (task.state) {
-            case NOT_STARTED -> {
-                task.state = TaskState.RUNNABLE;
-                r = wasm.invoke(task.ctx, config.entryExport(), NO_ARGS, remainingFuel);
-            }
-            case FORK_PENDING -> {
-                task.state = TaskState.RUNNABLE;
-                r = wasm.resume(task.ctx, remainingFuel, 0L);
-            }
-            default -> {
-                task.state = TaskState.RUNNABLE;
-                long parkResult = task.resumeValue; // ignored unless the parked call has a result
-                task.resumeValue = 0;
-                task.parkReleased = false;
-                r = wasm.resume(task.ctx, remainingFuel, parkResult);
-            }
+        if (task.state == TaskState.NOT_STARTED) {
+            task.state = TaskState.RUNNABLE;
+            r = wasm.invoke(task.ctx, config.entryExport(), NO_ARGS, remainingFuel);
+        } else {
+            task.state = TaskState.RUNNABLE;
+            // A spawned task's first turn lands here too: its context is already armed with a
+            // call to its entry function, so resuming it is what starts it. The park result is
+            // ignored unless the context is actually suspended inside a host call.
+            long parkResult = task.resumeValue;
+            task.resumeValue = 0;
+            task.parkReleased = false;
+            r = wasm.resume(task.ctx, remainingFuel, parkResult);
         }
         remainingFuel -= task.ctx.fuelConsumed();
         return r;
     }
 
-    private ExecResult resumeWith(Task task, long hostResult) {
-        currentTask = task;
-        ExecResult r = wasm.resume(task.ctx, remainingFuel, hostResult);
-        remainingFuel -= task.ctx.fuelConsumed();
-        return r;
+    /**
+     * The {@code spawn(entry, data)} import: starts a task running the function-table entry
+     * {@code entry} with the single argument {@code data}, and returns its task id to the
+     * spawner without yielding.
+     *
+     * <p>Everything the guest supplies is checked here and a violation kills the instance
+     * ({@link GuestAbort}) rather than trapping the caller: a bad table index is a broken
+     * SDK/animation, never something a guest can handle.
+     */
+    private long doSpawn(ExecutionContext ctx, int entry, int data) {
+        int fi = resolveSpawnEntry(ctx, entry);
+        int stackBytes = config.taskStackBytes();
+        // The stack is an ordinary heap block, so it charges the instance budget like anything
+        // else and a cap-exceeding spawn fails the same way a cap-exceeding malloc does.
+        int stackPtr = allocator.realloc(ctx, 0, 0, STACK_ALIGN, stackBytes);
+
+        ExecutionContext childCtx = ctx.spawnSibling();
+        // wasm shadow stacks grow downward, so the child starts at the top of its region.
+        childCtx.writeGlobal(stackPointerGlobal, (stackPtr + stackBytes) & -STACK_ALIGN);
+        wasm.prepareCall(childCtx, fi, new long[] {data});
+
+        Task child = new Task(nextTaskId++);
+        child.ctx = childCtx;
+        child.stackPtr = stackPtr;
+        child.stackBytes = stackBytes;
+        // RUNNABLE, not "pending": pickRunnable will hand it a turn later in this same tick,
+        // once the spawner reaches a blocking point. Nothing of it runs before then.
+        child.state = TaskState.RUNNABLE;
+        tasks.add(child);
+        return child.id;
     }
 
-    private Task doFork(Task parent, long currentTick) {
-        Task child = new Task(nextTaskId++);
-        child.ctx = parent.ctx.copy();
-        child.allocator = parent.allocator.copy();
-        child.state = TaskState.FORK_PENDING;
-        child.wakeTick = currentTick;
-        tasks.add(child);
-        return child;
+    /** Validates a spawn entry against the function table; returns the guest function index. */
+    private int resolveSpawnEntry(ExecutionContext ctx, int entry) {
+        if (ctx.tableCount() == 0) {
+            throw new GuestAbort("spawn(" + entry + "): the module declares no function table");
+        }
+        int size = ctx.tableSize(0);
+        if (entry < 0 || entry >= size) {
+            throw new GuestAbort("spawn: entry index " + entry
+                    + " is outside the function table (" + size + " entries)");
+        }
+        int fi = ctx.tableEntry(0, entry);
+        if (fi < 0) {
+            throw new GuestAbort("spawn: function table entry " + entry + " is null");
+        }
+        if (fi < wasm.importedFunctionCount()) {
+            throw new GuestAbort("spawn: function table entry " + entry
+                    + " is a host import, not a guest function");
+        }
+        FuncType type = wasm.functionTypeOf(fi);
+        if (!type.params().equals(List.of(ValType.I32)) || !type.results().isEmpty()) {
+            throw new GuestAbort("spawn: function table entry " + entry
+                    + " has type " + type.params() + " -> " + type.results()
+                    + " but a task entry must be fn(i32)");
+        }
+        return fi;
     }
 
     private TickResult applyResult(Task task, ExecResult result, long currentTick) {
@@ -687,8 +852,6 @@ public final class MachineInstance {
                 }
                 yield null;
             }
-            // fork is fully handled in runTurn's inline loop before we get here.
-            case ForkRequest ignored -> new TickResult.Errored("stray fork suspension");
         };
     }
 
@@ -709,7 +872,21 @@ public final class MachineInstance {
     private void finishTask(Task task) {
         task.state = TaskState.FINISHED;
         sync.removeTask(task.id);
-        task.allocator.releaseAll(); // the task's memory is gone; give its budget back
+        releaseStack(task);
+    }
+
+    /**
+     * Frees the ended task's stack region — and nothing else. Its heap allocations stay: they
+     * live in the one shared memory and other tasks may well still hold pointers into them,
+     * which is precisely the point of sharing. Freeing the stack is safe by the same token
+     * only because nothing outside a task should ever hold a pointer into its stack; a guest
+     * that leaks one out (and then gets killed mid-borrow) is the documented sharp edge of
+     * {@code kill}.
+     */
+    private void releaseStack(Task task) {
+        allocator.free(task.stackPtr, task.stackBytes);
+        task.stackPtr = 0;
+        task.stackBytes = 0;
     }
 
     private void finishAll() {
@@ -736,7 +913,7 @@ public final class MachineInstance {
             // contributed.
             t.state = TaskState.FINISHED;
             sync.removeTask(id);
-            t.allocator.releaseAll();
+            releaseStack(t);
         }
     }
 
@@ -751,10 +928,8 @@ public final class MachineInstance {
                 functions.forEach((name, fn) -> m.put(module + "." + name, fn)));
         String engine = config.engineModule();
         m.put(engine + ".realloc", (ctx, a) ->
-                currentTask.allocator.realloc(ctx, (int) a[0], (int) a[1], (int) a[2], (int) a[3]));
-        m.put(engine + ".fork", (ctx, a) -> {
-            throw ctx.suspend(FORK);
-        });
+                allocator.realloc(ctx, (int) a[0], (int) a[1], (int) a[2], (int) a[3]));
+        m.put(engine + ".spawn", (ctx, a) -> doSpawn(ctx, (int) a[0], (int) a[1]));
         m.put(engine + ".join", (ctx, a) -> {
             throw ctx.suspend(new JoinRequest((int) a[0]));
         });
@@ -774,6 +949,14 @@ public final class MachineInstance {
         });
         m.put(engine + ".fail", (ctx, a) -> {
             throw new GuestAbort(Marshal.readString(ctx, (int) a[0], (int) a[1]));
+        });
+        // The len/fill idiom: the guest sizes a buffer, then asks for the bytes. There is no
+        // blocking point between the two calls and the blob never changes during a run, so the
+        // pair cannot race.
+        m.put(engine + ".environ_len", (ctx, a) -> environBlob.length);
+        m.put(engine + ".environ_read", (ctx, a) -> {
+            ctx.writeBytes((int) a[0], environBlob);
+            return 0L;
         });
         addSyncImports(m, engine);
         addRandomImports(m, engine);

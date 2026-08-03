@@ -4,13 +4,12 @@ import static com.jhuanglululu.wasm.TestModule.I32;
 import static com.jhuanglululu.wasm.TestModule.i32Const;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
-/** Suspend/resume, fuel exhaustion, and context cloning. */
+/** Suspend/resume, fuel exhaustion, and sibling (spawned-task) contexts. */
 class InterpreterSuspendResumeTest {
 
     /**
@@ -80,25 +79,28 @@ class InterpreterSuspendResumeTest {
     }
 
     @Test
-    void cloneDivergesIndependently() {
+    void aSiblingContextSharesMemoryAndStartsWithEmptyStacks() {
         Instance inst = new Instance(Module.parse(suspendingModule()), Map.of("env.host", SUSPENDING));
         ExecutionContext ctx = inst.instantiate();
 
+        // Park the first context mid-host-call, then take a sibling. A sibling is a new task,
+        // not a copy: it inherits no frames and no suspension.
         assertInstanceOf(ExecResult.Suspended.class, inst.invoke(ctx, "main", new long[0], 1_000_000));
+        ExecutionContext sibling = ctx.spawnSibling();
+        assertNotSame(ctx, sibling);
+        assertEquals(0, sibling.frameCount());
 
-        // Clone at the suspension point; the clone is a fully independent context.
-        ExecutionContext clone = ctx.copy();
-        assertNotSame(ctx, clone);
-
-        ExecResult a = inst.resume(ctx, 1_000_000, 42);
-        ExecResult b = inst.resume(clone, 1_000_000, 7);
-
-        assertEquals(42, (int) ((ExecResult.Completed) a).values()[0]);
-        assertEquals(7, (int) ((ExecResult.Completed) b).values()[0]);
-
-        // Memories diverged and do not alias.
+        // Finish the first context: main stores its host result at address 0.
+        assertEquals(42, (int) ((ExecResult.Completed) inst.resume(ctx, 1_000_000, 42)).values()[0]);
         assertEquals(42, ctx.loadI32(0));
-        assertEquals(7, clone.loadI32(0));
-        assertNotEquals(ctx.loadI32(0), clone.loadI32(0));
+
+        // Run the same function on the sibling with a different host result. Address 0 is in
+        // the ONE shared memory, so the sibling's store is what both contexts now read.
+        inst.prepareCall(sibling, inst.importedFunctionCount(), new long[0]);
+        assertInstanceOf(ExecResult.Suspended.class, inst.resume(sibling, 1_000_000));
+        assertEquals(7, (int) ((ExecResult.Completed) inst.resume(sibling, 1_000_000, 7)).values()[0]);
+
+        assertEquals(7, sibling.loadI32(0));
+        assertEquals(7, ctx.loadI32(0), "the sibling's store is visible through the first context");
     }
 }

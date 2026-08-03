@@ -97,17 +97,35 @@ class HostAllocatorTest {
     }
 
     @Test
-    void copyIsIndependent() {
+    void freeReturnsAHostAllocatedBlockToTheFreeList() {
+        // The host's own free path (used for a task's stack region) must behave exactly like
+        // the guest's realloc-to-zero: the block goes back and the next request reuses it.
         ExecutionContext ctx = RuntimeWasm.memoryContext(2);
-        HostAllocator a = new HostAllocator(1024, 1 << 20);
-        int p1 = a.realloc(ctx, 0, 0, 8, 32);
-        HostAllocator b = a.copy();
-        // Allocations from the two allocators must not overlap the still-live p1, and the
-        // fork's bookkeeping is independent: freeing in one does not affect the other.
-        int p2 = b.realloc(ctx, 0, 0, 8, 32);
-        assertEquals(p1 + 32, p2); // b continued a's bump top
-        a.realloc(ctx, p1, 32, 8, 0); // free in a only
-        int p3 = b.realloc(ctx, 0, 0, 8, 32); // b does not see a's freed block
-        assertTrue(p3 != p1);
+        MemoryBudget budget = new MemoryBudget(1 << 20);
+        HostAllocator a = new HostAllocator(1024, budget);
+        int keep = a.realloc(ctx, 0, 0, 8, 32);
+        int block = a.realloc(ctx, 0, 0, 8, 64);
+        assertEquals(keep + 32, block);
+        long chargedWithBoth = budget.used();
+
+        a.free(block, 64);
+        assertEquals(chargedWithBoth - 64, budget.used(), "the freed block gave its bytes back");
+        assertEquals(block, a.realloc(ctx, 0, 0, 8, 64), "the same address is handed out again");
+    }
+
+    @Test
+    void freeOfTheNullPointerDoesNothing() {
+        // Task 0 has no host-allocated stack, so the engine frees pointer 0 on every plain
+        // task end; that must not disturb the heap or the budget.
+        ExecutionContext ctx = RuntimeWasm.memoryContext(2);
+        MemoryBudget budget = new MemoryBudget(1 << 20);
+        HostAllocator a = new HostAllocator(1024, budget);
+        int p = a.realloc(ctx, 0, 0, 8, 32);
+        long charged = budget.used();
+
+        a.free(0, 0);
+
+        assertEquals(charged, budget.used());
+        assertEquals(p + 32, a.realloc(ctx, 0, 0, 8, 32));
     }
 }

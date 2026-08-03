@@ -77,7 +77,7 @@ class ErrorPathsTest {
         MachineInstance inst = instance(SyncWasm.module(new P(), 3), 1 << 20);
         String message = inst.loadError().orElseThrow();
         assertTrue(message.contains("_engine_abi") && message.contains("returned 3")
-                && message.contains("1..1"), message);
+                && message.contains("2..2"), message);
         assertErroredContains(inst.tick(0, 1_000_000), "handshake");
     }
 
@@ -96,7 +96,7 @@ class ErrorPathsTest {
     @Test
     void theEngineHandshakeVersionIsWhatTheFixturesReport() {
         // One constant, referenced by the fixtures and by every future embedder.
-        assertEquals(1, MachineInstance.ENGINE_ABI_VERSION);
+        assertEquals(2, MachineInstance.ENGINE_ABI_VERSION);
     }
 
     @Test

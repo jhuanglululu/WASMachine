@@ -9,10 +9,16 @@ import java.util.Objects;
  * re-entering it. Guest calls never recurse on the Java call stack — an explicit
  * {@link Frame} stack is used instead.
  *
- * <p>Owned state (deep-copied by {@link #copy()}, the primitive a fork builds on):
- * an operand stack ({@code long[]}, raw bits — floats via {@code Float/Double.*Bits}),
- * a frame stack, its own little-endian linear {@code memory}, its own {@code globals},
- * its own tables, and the passive-segment drop bookkeeping.
+ * <p>One context is one <em>task</em>. State splits in two:
+ * <ul>
+ *   <li><b>Per task</b> — the operand stack ({@code long[]}, raw bits: floats via
+ *       {@code Float/Double.*Bits}), the frame stack, and the {@code globals} (so each task
+ *       carries its own {@code __stack_pointer} and therefore its own shadow stack).</li>
+ *   <li><b>Shared with every sibling task</b> — the {@link LinearMemory}, the tables, and the
+ *       passive-segment drop flags. {@link #spawnSibling()} hands these on by reference, which
+ *       is what makes a guest pointer, a table index, or a dropped segment mean the same thing
+ *       in every task of an instance.</li>
+ * </ul>
  *
  * <h2>Mid-host-call resume protocol</h2>
  * When a {@link HostFunction} calls {@link #suspend}, it throws {@link SuspendSignal};
@@ -53,20 +59,6 @@ public final class ExecutionContext {
         // endPc, whereas a block/if branches to its own endPc.
         int[] labels;
         int labelSp;
-
-        Frame copy() {
-            Frame f = new Frame();
-            f.funcIndex = funcIndex;
-            f.body = body;             // immutable, shared
-            f.sideTable = sideTable;   // immutable, shared
-            f.locals = locals.clone();
-            f.pc = pc;
-            f.stackBase = stackBase;
-            f.resultArity = resultArity;
-            f.labels = labels.clone();
-            f.labelSp = labelSp;
-            return f;
-        }
     }
 
     private final Instance instance;
@@ -77,22 +69,19 @@ public final class ExecutionContext {
     private Frame[] frames = new Frame[16];
     private int frameSp;
 
-    private byte[] memory = new byte[0];
-    private int memPages;
-    private int memMaxPages;
-
-    private long[] globals = new long[0];
-
+    // Instance-level state, shared with every sibling task (see spawnSibling).
+    private LinearMemory mem = new LinearMemory();
     private int[][] tables = new int[0][];
     private int[] tableMax = new int[0];
-
     private boolean[] dataDropped = new boolean[0];
     private boolean[] elemDropped = new boolean[0];
+
+    // Per-task state.
+    private long[] globals = new long[0];
 
     private Status status = Status.RUNNABLE;
     private int suspendHostArity;
     private Object suspendRequest;
-    private long[] completedValues;
     private long fuelConsumedThisRun;
     private long fuel; // remaining fuel for the current run(); a field so bulk ops can charge
 
@@ -110,44 +99,44 @@ public final class ExecutionContext {
 
     /** The linear memory size in bytes. */
     public int memorySize() {
-        return memPages * PAGE;
+        return mem.pages * PAGE;
     }
 
     /** The number of linear-memory pages. */
     public int memoryPageCount() {
-        return memPages;
+        return mem.pages;
     }
 
     public byte loadByte(int addr) {
-        return memory[Objects.checkIndex(addr, memory.length)];
+        return mem.data[Objects.checkIndex(addr, mem.data.length)];
     }
 
     public void storeByte(int addr, byte value) {
-        memory[Objects.checkIndex(addr, memory.length)] = value;
+        mem.data[Objects.checkIndex(addr, mem.data.length)] = value;
     }
 
-    /** Reads a little-endian 32-bit value from linear memory. */
+    /** Reads a little-endian 32-bit value from linear mem.data. */
     public int loadI32(int addr) {
-        Objects.checkFromIndexSize(addr, 4, memory.length);
-        return readI32(memory, addr);
+        Objects.checkFromIndexSize(addr, 4, mem.data.length);
+        return readI32(mem.data, addr);
     }
 
-    /** Writes a little-endian 32-bit value to linear memory. */
+    /** Writes a little-endian 32-bit value to linear mem.data. */
     public void storeI32(int addr, int value) {
-        Objects.checkFromIndexSize(addr, 4, memory.length);
-        writeI32(memory, addr, value);
+        Objects.checkFromIndexSize(addr, 4, mem.data.length);
+        writeI32(mem.data, addr, value);
     }
 
     /** Copies {@code length} bytes of linear memory starting at {@code addr}. */
     public byte[] readBytes(int addr, int length) {
-        Objects.checkFromIndexSize(addr, length, memory.length);
-        return Arrays.copyOfRange(memory, addr, addr + length);
+        Objects.checkFromIndexSize(addr, length, mem.data.length);
+        return Arrays.copyOfRange(mem.data, addr, addr + length);
     }
 
     /** Writes {@code src} into linear memory at {@code addr} (bounds-checked). */
     public void writeBytes(int addr, byte[] src) {
-        Objects.checkFromIndexSize(addr, src.length, memory.length);
-        System.arraycopy(src, 0, memory, addr, src.length);
+        Objects.checkFromIndexSize(addr, src.length, mem.data.length);
+        System.arraycopy(src, 0, mem.data, addr, src.length);
     }
 
     public long readGlobal(int index) {
@@ -155,17 +144,46 @@ public final class ExecutionContext {
     }
 
     /**
+     * Writes one of this task's globals. Globals are per task, so this touches no sibling —
+     * which is what lets the host give a spawned task its own {@code __stack_pointer}.
+     */
+    public void writeGlobal(int index, long value) {
+        globals[index] = value;
+    }
+
+    /** How many entries table {@code tableIndex} currently holds. */
+    public int tableSize(int tableIndex) {
+        return tables[tableIndex].length;
+    }
+
+    /** The number of tables this instance has (0 or 1 for anything rustc emits). */
+    public int tableCount() {
+        return tables.length;
+    }
+
+    /**
+     * The function index stored at {@code elemIndex} of table {@code tableIndex}, or
+     * {@code -1} for a null element. Out-of-range indices throw
+     * {@link IndexOutOfBoundsException}; callers that take the index from the guest are
+     * expected to range-check with {@link #tableSize} first and report it their own way.
+     */
+    public int tableEntry(int tableIndex, int elemIndex) {
+        return tables[tableIndex][Objects.checkIndex(elemIndex, tables[tableIndex].length)];
+    }
+
+    /**
      * Grows linear memory by {@code deltaPages} pages, honoring the configured
      * maximum (the {@code memory.grow} instruction semantics, callable from a host
      * function). Returns the previous page count, or {@code -1} if the growth would
-     * exceed the maximum (memory unchanged).
+     * exceed the maximum (memory unchanged). The growth is visible to every sibling
+     * task at once, because they all read the same {@link LinearMemory}.
      */
     public int growMemory(int deltaPages) {
-        long np = (long) memPages + (deltaPages & 0xFFFFFFFFL);
-        if (deltaPages < 0 || np > memMaxPages) {
+        long np = (long) mem.pages + (deltaPages & 0xFFFFFFFFL);
+        if (deltaPages < 0 || np > mem.maxPages) {
             return -1;
         }
-        int old = memPages;
+        int old = mem.pages;
         growMemoryUnchecked((int) np);
         return old;
     }
@@ -184,49 +202,54 @@ public final class ExecutionContext {
         return new SuspendSignal(request);
     }
 
-    // --- deep copy (fork primitive) ---
+    // --- sibling tasks (the spawn primitive) ---
 
-    /** A fully independent deep copy: stacks, frames, memory, globals, tables. */
-    public ExecutionContext copy() {
+    /**
+     * A fresh context for a new task of the same instance: it <em>shares</em> this one's
+     * linear memory, tables and segment-drop flags, gets a private copy of the globals, and
+     * starts with empty operand and frame stacks (the caller sets up its entry frame).
+     *
+     * <p>Why each half is what it is:
+     * <ul>
+     *   <li><b>Memory shared</b> — the whole point of ABI 2: a pointer handed to a spawned
+     *       task must address the same bytes.</li>
+     *   <li><b>Tables shared</b> — a table index travels through shared memory (a spawn entry
+     *       is one), so it has to resolve to the same function everywhere; a per-task copy
+     *       would silently diverge the moment a guest wrote to the table.</li>
+     *   <li><b>Drop flags shared</b> — "this passive segment has been consumed into memory"
+     *       is a fact about the one memory, not about a task.</li>
+     *   <li><b>Globals copied</b> — {@code __stack_pointer} is a global, and each task needs
+     *       its own shadow stack. Copying rather than sharing also means a spawned task
+     *       inherits the spawner's global state at the moment of the spawn, which is the
+     *       Linux-ish behaviour guests already expect.</li>
+     *   <li><b>Stacks empty</b> — the child begins at a call to its entry function; it does
+     *       not continue the spawner's control flow.</li>
+     * </ul>
+     */
+    public ExecutionContext spawnSibling() {
         ExecutionContext c = new ExecutionContext(instance);
-        c.stack = stack.clone();
-        c.sp = sp;
-        c.frames = new Frame[frames.length];
-        c.frameSp = frameSp;
-        for (int i = 0; i < frameSp; i++) {
-            c.frames[i] = frames[i].copy();
-        }
-        c.memory = memory.clone();
-        c.memPages = memPages;
-        c.memMaxPages = memMaxPages;
+        c.mem = mem;
+        c.tables = tables;
+        c.tableMax = tableMax;
+        c.dataDropped = dataDropped;
+        c.elemDropped = elemDropped;
         c.globals = globals.clone();
-        c.tables = new int[tables.length][];
-        for (int i = 0; i < tables.length; i++) {
-            c.tables[i] = tables[i].clone();
-        }
-        c.tableMax = tableMax.clone();
-        c.dataDropped = dataDropped.clone();
-        c.elemDropped = elemDropped.clone();
-        c.status = status;
-        c.suspendHostArity = suspendHostArity;
-        c.suspendRequest = suspendRequest;
-        c.completedValues = completedValues == null ? null : completedValues.clone();
         return c;
     }
 
     // --- instantiation-time setup (called by Instance) ---
 
     void initMemory(int pages, int maxPages) {
-        this.memPages = pages;
-        this.memMaxPages = maxPages;
-        this.memory = new byte[pages * PAGE];
+        this.mem.pages = pages;
+        this.mem.maxPages = maxPages;
+        this.mem.data = new byte[pages * PAGE];
     }
 
     void growMemoryUnchecked(int newPages) {
         byte[] nm = new byte[newPages * PAGE];
-        System.arraycopy(memory, 0, nm, 0, memory.length);
-        memory = nm;
-        memPages = newPages;
+        System.arraycopy(mem.data, 0, nm, 0, mem.data.length);
+        mem.data = nm;
+        mem.pages = newPages;
     }
 
     void initGlobals(int count) {
@@ -257,10 +280,6 @@ public final class ExecutionContext {
 
     void markElemDropped(int index) {
         elemDropped[index] = true;
-    }
-
-    byte[] memoryArray() {
-        return memory;
     }
 
     int[] table(int index) {
@@ -711,43 +730,43 @@ public final class ExecutionContext {
                     t[i] = v;
                 }
                 // --- loads ---
-                case 0x28 -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushI32(readI32(memory, (int) a)); }
-                case 0x29 -> { long a = ea(f); if (oob(a, 8)) return trapMem(); pushI64(readI64(memory, (int) a)); }
-                case 0x2A -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushF32(Float.intBitsToFloat(readI32(memory, (int) a))); }
-                case 0x2B -> { long a = ea(f); if (oob(a, 8)) return trapMem(); pushI64(readI64(memory, (int) a)); }
-                case 0x2C -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI32(memory[(int) a]); }
-                case 0x2D -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI32(memory[(int) a] & 0xFF); }
+                case 0x28 -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushI32(readI32(mem.data, (int) a)); }
+                case 0x29 -> { long a = ea(f); if (oob(a, 8)) return trapMem(); pushI64(readI64(mem.data, (int) a)); }
+                case 0x2A -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushF32(Float.intBitsToFloat(readI32(mem.data, (int) a))); }
+                case 0x2B -> { long a = ea(f); if (oob(a, 8)) return trapMem(); pushI64(readI64(mem.data, (int) a)); }
+                case 0x2C -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI32(mem.data[(int) a]); }
+                case 0x2D -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI32(mem.data[(int) a] & 0xFF); }
                 case 0x2E -> { long a = ea(f); if (oob(a, 2)) return trapMem(); pushI32((short) load16(a)); }
                 case 0x2F -> { long a = ea(f); if (oob(a, 2)) return trapMem(); pushI32(load16(a)); }
-                case 0x30 -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI64(memory[(int) a]); }
-                case 0x31 -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI64(memory[(int) a] & 0xFF); }
+                case 0x30 -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI64(mem.data[(int) a]); }
+                case 0x31 -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI64(mem.data[(int) a] & 0xFF); }
                 case 0x32 -> { long a = ea(f); if (oob(a, 2)) return trapMem(); pushI64((short) load16(a)); }
                 case 0x33 -> { long a = ea(f); if (oob(a, 2)) return trapMem(); pushI64(load16(a)); }
-                case 0x34 -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushI64(readI32(memory, (int) a)); }
-                case 0x35 -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushI64(readI32(memory, (int) a) & 0xFFFFFFFFL); }
+                case 0x34 -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushI64(readI32(mem.data, (int) a)); }
+                case 0x35 -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushI64(readI32(mem.data, (int) a) & 0xFFFFFFFFL); }
                 // --- stores ---
-                case 0x36 -> { int v = popI32(); long a = ea(f); if (oob(a, 4)) return trapMem(); writeI32(memory, (int) a, v); }
-                case 0x37 -> { long v = popI64(); long a = ea(f); if (oob(a, 8)) return trapMem(); writeI64(memory, (int) a, v); }
-                case 0x38 -> { int v = popI32(); long a = ea(f); if (oob(a, 4)) return trapMem(); writeI32(memory, (int) a, v); } // f32.store (raw bits)
-                case 0x39 -> { long v = popI64(); long a = ea(f); if (oob(a, 8)) return trapMem(); writeI64(memory, (int) a, v); } // f64.store (raw bits)
-                case 0x3A -> { int v = popI32(); long a = ea(f); if (oob(a, 1)) return trapMem(); memory[(int) a] = (byte) v; }
+                case 0x36 -> { int v = popI32(); long a = ea(f); if (oob(a, 4)) return trapMem(); writeI32(mem.data, (int) a, v); }
+                case 0x37 -> { long v = popI64(); long a = ea(f); if (oob(a, 8)) return trapMem(); writeI64(mem.data, (int) a, v); }
+                case 0x38 -> { int v = popI32(); long a = ea(f); if (oob(a, 4)) return trapMem(); writeI32(mem.data, (int) a, v); } // f32.store (raw bits)
+                case 0x39 -> { long v = popI64(); long a = ea(f); if (oob(a, 8)) return trapMem(); writeI64(mem.data, (int) a, v); } // f64.store (raw bits)
+                case 0x3A -> { int v = popI32(); long a = ea(f); if (oob(a, 1)) return trapMem(); mem.data[(int) a] = (byte) v; }
                 case 0x3B -> { int v = popI32(); long a = ea(f); if (oob(a, 2)) return trapMem(); store16(a, v); }
-                case 0x3C -> { long v = popI64(); long a = ea(f); if (oob(a, 1)) return trapMem(); memory[(int) a] = (byte) v; }
+                case 0x3C -> { long v = popI64(); long a = ea(f); if (oob(a, 1)) return trapMem(); mem.data[(int) a] = (byte) v; }
                 case 0x3D -> { long v = popI64(); long a = ea(f); if (oob(a, 2)) return trapMem(); store16(a, (int) v); }
-                case 0x3E -> { long v = popI64(); long a = ea(f); if (oob(a, 4)) return trapMem(); writeI32(memory, (int) a, (int) v); }
-                case 0x3F -> { readVarU32(f); pushI32(memPages); }   // memory.size
-                case 0x40 -> {                                       // memory.grow
+                case 0x3E -> { long v = popI64(); long a = ea(f); if (oob(a, 4)) return trapMem(); writeI32(mem.data, (int) a, (int) v); }
+                case 0x3F -> { readVarU32(f); pushI32(mem.pages); }   // mem.data.size
+                case 0x40 -> {                                       // mem.data.grow
                     readVarU32(f);
                     long d = peek() & 0xFFFFFFFFL; // peek delta; don't pop until affordable
-                    long np = memPages + d;
-                    if (np > memMaxPages) {
+                    long np = mem.pages + d;
+                    if (np > mem.maxPages) {
                         dropSlots(1);
                         pushI32(-1); // failure is cheap: no allocation
                     } else if (!afford(1 + d * (PAGE >>> 4), pc, f)) {
                         return new ExecResult.FuelExhausted();
                     } else {
                         dropSlots(1);
-                        int old = memPages;
+                        int old = mem.pages;
                         growMemoryUnchecked((int) np);
                         pushI32(old);
                     }
@@ -943,20 +962,20 @@ public final class ExecutionContext {
         return (popI32() & 0xFFFFFFFFL) + off;
     }
 
-    /** True if [addr, addr+size) is out of bounds of linear memory. */
+    /** True if [addr, addr+size) is out of bounds of linear mem.data. */
     private boolean oob(long addr, int size) {
-        return addr + size > (long) memPages * PAGE;
+        return addr + size > (long) mem.pages * PAGE;
     }
 
     private int load16(long a) {
         int i = (int) a;
-        return (memory[i] & 0xFF) | ((memory[i + 1] & 0xFF) << 8);
+        return (mem.data[i] & 0xFF) | ((mem.data[i + 1] & 0xFF) << 8);
     }
 
     private void store16(long a, int v) {
         int i = (int) a;
-        memory[i] = (byte) v;
-        memory[i + 1] = (byte) (v >>> 8);
+        mem.data[i] = (byte) v;
+        mem.data[i + 1] = (byte) (v >>> 8);
     }
 
     private ExecResult trapMem() {
@@ -1043,7 +1062,6 @@ public final class ExecutionContext {
             System.arraycopy(stack, done.stackBase, res, 0, done.resultArity);
             sp = done.stackBase;
             status = Status.COMPLETED;
-            completedValues = res;
             return new ExecResult.Completed(res);
         }
         return null;
@@ -1112,7 +1130,7 @@ public final class ExecutionContext {
             case 5 -> pushI64(satTruncU64(popF32()));
             case 6 -> pushI64(satTruncI64(popF64()));
             case 7 -> pushI64(satTruncU64(popF64()));
-            case 8 -> { // memory.init dataidx memidx
+            case 8 -> { // mem.data.init dataidx memidx
                 int dataIdx = readVarU32(f);
                 readVarU32(f); // memidx (0)
                 long len = peek() & 0xFFFFFFFFL; // peek
@@ -1123,13 +1141,13 @@ public final class ExecutionContext {
                 long src = popI32() & 0xFFFFFFFFL;
                 long dst = popI32() & 0xFFFFFFFFL;
                 byte[] seg = dataDropped[dataIdx] ? EMPTY : instance.dataSegment(dataIdx);
-                if (src + len > seg.length || dst + len > (long) memPages * PAGE) {
+                if (src + len > seg.length || dst + len > (long) mem.pages * PAGE) {
                     return trapMem();
                 }
-                System.arraycopy(seg, (int) src, memory, (int) dst, (int) len);
+                System.arraycopy(seg, (int) src, mem.data, (int) dst, (int) len);
             }
             case 9 -> dataDropped[readVarU32(f)] = true; // data.drop
-            case 10 -> { // memory.copy
+            case 10 -> { // mem.data.copy
                 readVarU32(f);
                 readVarU32(f);
                 long len = peek() & 0xFFFFFFFFL; // peek
@@ -1139,13 +1157,13 @@ public final class ExecutionContext {
                 dropSlots(1);
                 long src = popI32() & 0xFFFFFFFFL;
                 long dst = popI32() & 0xFFFFFFFFL;
-                long size = (long) memPages * PAGE;
+                long size = (long) mem.pages * PAGE;
                 if (src + len > size || dst + len > size) {
                     return trapMem();
                 }
-                System.arraycopy(memory, (int) src, memory, (int) dst, (int) len);
+                System.arraycopy(mem.data, (int) src, mem.data, (int) dst, (int) len);
             }
-            case 11 -> { // memory.fill
+            case 11 -> { // mem.data.fill
                 readVarU32(f);
                 long len = peek() & 0xFFFFFFFFL; // peek
                 if (!afford(1 + (len >>> BULK_UNIT_SHIFT), opPc, f)) {
@@ -1154,10 +1172,10 @@ public final class ExecutionContext {
                 dropSlots(1);
                 byte val = (byte) popI32();
                 long dst = popI32() & 0xFFFFFFFFL;
-                if (dst + len > (long) memPages * PAGE) {
+                if (dst + len > (long) mem.pages * PAGE) {
                     return trapMem();
                 }
-                Arrays.fill(memory, (int) dst, (int) (dst + len), val);
+                Arrays.fill(mem.data, (int) dst, (int) (dst + len), val);
             }
             case 12 -> { // table.init elemidx tableidx
                 int elemIdx = readVarU32(f);

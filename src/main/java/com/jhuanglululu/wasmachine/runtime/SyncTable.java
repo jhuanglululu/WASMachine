@@ -13,8 +13,9 @@ import java.util.Set;
 
 /**
  * The per-instance table of host-side sync objects — signals, barriers, and/or composites,
- * and channels — all in one {@code i32} id space (so ids are plain integers that survive a
- * fork's memory copy for free). This is the whole of the engine's sync semantics; it is pure
+ * and channels — all in one {@code i32} id space (so ids are plain integers that a spawned task
+ * reads out of the shared memory like any other value). This is the whole of the engine's
+ * sync semantics; it is pure
  * headless data structure work, and it never touches the interpreter: parking is expressed
  * by returning {@link SyncOutcome#PARK}, releasing by calling the {@link Waker}.
  *

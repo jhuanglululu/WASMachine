@@ -91,6 +91,11 @@ public final class Buf {
         return uleb(count);
     }
 
+    /** Bytes written so far — the offset the next write lands at (for later patching). */
+    public int size() {
+        return o.size();
+    }
+
     public byte[] toBytes() {
         return o.toByteArray();
     }
