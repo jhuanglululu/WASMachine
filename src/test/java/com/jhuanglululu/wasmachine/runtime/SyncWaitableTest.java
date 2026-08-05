@@ -33,8 +33,8 @@ class SyncWaitableTest {
         // Park order is 0, 2, 1 (task 1 sleeps a tick first) but all three resume in spawn order.
         P main = new P()
                 .i32(3).call(BARRIER_NEW).set(0)
-                .child(0, new P().sleep(1).get(0).call(WAIT).log(B))
-                .child(0, new P().get(0).call(WAIT).log(C))
+                .child(new P().sleep(1).get(0).call(WAIT).log(B))
+                .child(new P().get(0).call(WAIT).log(C))
                 .get(0).call(WAIT).log(A)
                 .sleep(10);
 
@@ -50,11 +50,7 @@ class SyncWaitableTest {
                 .i32(2).call(BARRIER_NEW).set(0)
                 .call(SIGNAL_NEW).set(1)
                 .get(0).get(1).call(WAIT_ANY).set(2)
-                // The child needs two ids: the composite rides across as the spawn argument,
-                // the barrier through the (shared) linear memory.
-                .store(SyncWasm.VARS, 0)
-                .child(2, new P().get(0).call(WAIT).log(B)
-                        .load(SyncWasm.VARS).call(WAIT).log(D))
+                .child(new P().get(2).call(WAIT).log(B).get(0).call(WAIT).log(D))
                 .sleep(1)
                 .get(1).i32(0).call(SIGNAL_NOTIFY).log(A)
                 .get(0).call(WAIT).log(E)
@@ -70,7 +66,7 @@ class SyncWaitableTest {
                 .call(SIGNAL_NEW).set(0)
                 .call(SIGNAL_NEW).set(1)
                 .get(0).get(1).call(WAIT_ALL).set(2)
-                .child(2, new P().get(0).call(WAIT).log(B))
+                .child(new P().get(2).call(WAIT).log(B))
                 .sleep(1)
                 .get(0).i32(0).call(SIGNAL_NOTIFY).log(A)
                 .sleep(1)
@@ -87,7 +83,7 @@ class SyncWaitableTest {
                 .call(SIGNAL_NEW).set(0)
                 .call(SIGNAL_NEW).set(1)
                 .get(0).get(1).call(WAIT_ANY).set(2)
-                .child(2, new P().get(0).call(WAIT).log(B))
+                .child(new P().get(2).call(WAIT).log(B))
                 .sleep(1)
                 .get(1).i32(0).call(SIGNAL_NOTIFY).log(A)
                 .sleep(5);
@@ -104,7 +100,7 @@ class SyncWaitableTest {
                 .call(SIGNAL_NEW).set(2)
                 .get(0).get(1).call(WAIT_ANY).set(3)
                 .get(3).get(2).call(WAIT_ALL).set(4)
-                .child(4, new P().get(0).call(WAIT).log(B))
+                .child(new P().get(4).call(WAIT).log(B))
                 .sleep(1)
                 .get(2).i32(0).call(SIGNAL_NOTIFY).log(A)
                 .sleep(1)
@@ -121,9 +117,9 @@ class SyncWaitableTest {
     private static P notifyProgram(int mode, P beforeNotify) {
         return new P()
                 .call(SIGNAL_NEW).set(0)
-                .child(0, new P().sleep(2).get(0).call(WAIT).log(B))
-                .child(0, new P().sleep(1).get(0).call(WAIT).log(C))
-                .child(0, new P().get(0).call(WAIT).log(D))
+                .child(new P().sleep(2).get(0).call(WAIT).log(B))
+                .child(new P().sleep(1).get(0).call(WAIT).log(C))
+                .child(new P().get(0).call(WAIT).log(D))
                 .sleep(3)
                 .append(beforeNotify)
                 .get(0).i32(mode).call(SIGNAL_NOTIFY).log(A)
@@ -172,8 +168,8 @@ class SyncWaitableTest {
                 .call(SIGNAL_NEW).set(0)                                  // sig = 1
                 .call(SIGNAL_NEW).set(1)                                  // other = 2
                 .get(0).get(1).call(WAIT_ALL).set(2)                      // both = 3
-                .child(2, new P().get(0).call(WAIT).log(B))                  // task 1 on the composite
-                .child(0, new P().sleep(2).get(0).call(WAIT).log(C))         // task 2 on the bare signal
+                .child(new P().get(2).call(WAIT).log(B))                  // task 1 on the composite
+                .child(new P().sleep(2).get(0).call(WAIT).log(C))         // task 2 on the bare signal
                 // Tick 1: only the composite waiter exists, so this latches sig on task 1 alone.
                 .sleep(1)
                 .get(0).i32(0).call(SIGNAL_NOTIFY)
@@ -201,7 +197,7 @@ class SyncWaitableTest {
                 .call(SIGNAL_NEW).set(0)
                 .call(SIGNAL_NEW).set(1)
                 .get(0).get(1).call(WAIT_ALL).set(2)
-                .child(2, new P().get(0).call(WAIT).log(B))
+                .child(new P().get(2).call(WAIT).log(B))
                 .sleep(2)
                 .get(0).i32(0).call(SIGNAL_NOTIFY)      // latch
                 .get(0).i32(1).call(SIGNAL_NOTIFY)      // oldest: nobody eligible
@@ -226,7 +222,7 @@ class SyncWaitableTest {
                 .get(0).i32(1).call(SIGNAL_NOTIFY)
                 .get(0).i32(2).call(SIGNAL_NOTIFY)
                 .get(0).i32(3).call(SIGNAL_NOTIFY)
-                .child(0, new P().get(0).call(WAIT).log(B))
+                .child(new P().get(0).call(WAIT).log(B))
                 .sleep(1).log(A)
                 .sleep(1).get(0).i32(0).call(SIGNAL_NOTIFY).log(C)
                 .sleep(5);
@@ -241,9 +237,9 @@ class SyncWaitableTest {
         // do if the dead task's arrival was given back.
         P main = new P()
                 .i32(2).call(BARRIER_NEW).set(0)
-                .childWithId(1, 0, new P().get(0).call(WAIT).log(B))
-                .child(0, new P().sleep(2).get(0).call(WAIT).log(C))
-                .child(0, new P().sleep(3).get(0).call(WAIT).log(D))
+                .childWithId(1, new P().get(0).call(WAIT).log(B))
+                .child(new P().sleep(2).get(0).call(WAIT).log(C))
+                .child(new P().sleep(3).get(0).call(WAIT).log(D))
                 .sleep(1)
                 .get(1).call(KILL).log(A)
                 .sleep(1).log(E)

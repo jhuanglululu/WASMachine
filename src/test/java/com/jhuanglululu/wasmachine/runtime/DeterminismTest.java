@@ -16,7 +16,7 @@ class DeterminismTest {
     void tasksWokenSameTickRunInSpawnOrder() {
         List<String> logs = new ArrayList<>();
         MachineInstance inst = new MachineInstance(
-                Module.parse(RuntimeWasm.spawnDeterminismModule()),
+                Module.parse(RuntimeWasm.forkDeterminismModule()),
                 new MachineInstance.Config("det", RuntimeWasm.ENGINE_MODULE, "_engine_main",
                         List.of(SyncRun.ENGINE_ABI), 1 << 20, 0L),
                 (name, message) -> logs.add(message),

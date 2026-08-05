@@ -12,9 +12,8 @@ import java.util.Map;
  *
  * <p>The {@code Instance} holds only the shared, immutable configuration (the module,
  * the resolved host functions, the export table). All mutable execution state lives in
- * the {@link ExecutionContext}. {@link #instantiate()} produces the first one — task 0 —
- * and every further task is an {@link ExecutionContext#spawnSibling()} of it, sharing its
- * memory and tables while keeping its own stacks and globals.
+ * the {@link ExecutionContext}, which is what a fork clones — so one {@code Instance}
+ * can back many independent contexts.
  *
  * <p>Only <b>function</b> imports are supported (as {@code module.name -> HostFunction});
  * this matches the {@code wasm32-unknown-unknown} target, which defines and exports its
@@ -221,45 +220,6 @@ public final class Instance {
         }
         ctx.setupEntryFrame(fi, args);
         return ctx.run(fuel);
-    }
-
-    /**
-     * The declared signature of function {@code funcIndex} in the module's whole function
-     * index space (imports first, then defined functions). Embedders use it to type-check a
-     * function index a guest handed them — a spawn entry, say — before calling it.
-     */
-    public FuncType functionTypeOf(int funcIndex) {
-        return module.functionType(funcIndex);
-    }
-
-    /** Functions the module imports: an index below this is a host function, not a guest one. */
-    public int importedFunctionCount() {
-        return module.importedFunctionCount();
-    }
-
-    /**
-     * Arms {@code ctx} to call defined function {@code funcIndex} with {@code args} — the
-     * entry frame is pushed but nothing runs, so the caller decides when (and with how much
-     * fuel) the call actually starts, via {@link #resume}. This is what a spawned task is
-     * built from: a fresh sibling context armed with the guest's entry function.
-     *
-     * @throws IllegalArgumentException if {@code funcIndex} is an import or the argument
-     *     count does not match the signature
-     * @throws IllegalStateException if {@code ctx} is not idle
-     */
-    public void prepareCall(ExecutionContext ctx, int funcIndex, long[] args) {
-        if (funcIndex < module.importedFunctionCount()) {
-            throw new IllegalArgumentException("function " + funcIndex + " is an import");
-        }
-        FuncType type = module.functionType(funcIndex);
-        if (args.length != type.params().size()) {
-            throw new IllegalArgumentException("expected " + type.params().size()
-                    + " argument(s) but got " + args.length);
-        }
-        if (ctx.frameCount() != 0) {
-            throw new IllegalStateException("context is not idle");
-        }
-        ctx.setupEntryFrame(funcIndex, args);
     }
 
     /** Resume a suspended or fuel-exhausted context, supplying no host result value. */

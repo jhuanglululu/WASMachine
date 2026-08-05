@@ -1,15 +1,14 @@
 package com.jhuanglululu.wasmachine.runtime;
 
 /**
- * The animation's single memory allowance. Both the guest heap ({@link HostAllocator} — one per
- * instance, shared by every task) and the host-side channel buffers ({@link SyncTable}) charge
- * the same counter, because the configured cap is documented as a <em>per-instance</em> cap: an
- * animation must not be able to hold a full cap of heap and then a second full cap of queued
- * messages.
+ * The animation's single memory allowance. Both the guest heaps ({@link HostAllocator}, one per
+ * task) and the host-side channel buffers ({@link SyncTable}) charge the same counter, because the
+ * configured cap is documented as a <em>per-instance</em> cap: an animation must not be able to
+ * hold a full cap of heap and then a second full cap of queued messages.
  *
- * <p>Since engine ABI 2 the tasks of an instance share one linear memory, so the heap side of
- * the charge is simply that one heap's high-water mark. Per-task stack regions are ordinary
- * allocations out of it, charged while the task lives and returned when it ends.
+ * <p>Charging every task's heap rather than capping each separately is the same rule read
+ * honestly — a forked task's memory is a real second copy, so an instance's footprint is the sum
+ * over its tasks.
  *
  * <p>Reservations are all-or-nothing: a refused one throws {@link MemoryCapExceededException} and
  * consumes nothing, so the caller's own bookkeeping stays consistent.

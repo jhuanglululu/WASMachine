@@ -6,24 +6,20 @@ import java.util.TreeMap;
 
 /**
  * The host side of the guest's {@code #[global_allocator]}: it implements the
- * {@code realloc(ptr, old_size, align, new_size)} ABI import over the instance's linear
+ * {@code realloc(ptr, old_size, align, new_size)} ABI import over a task's linear
  * memory, so no {@code dlmalloc} is compiled into the animation.
- *
- * <p><b>One allocator per instance</b>, not per task: since engine ABI 2 every task of an
- * instance shares one linear memory, so there is one heap and one free list. A pointer
- * allocated by any task is valid in all of them, and the instance's memory charge is simply
- * this heap's high-water mark — no fork copy to charge twice.
  *
  * <p>It is a real free-list allocator with coalescing (not a bump pointer): freed
  * blocks are merged with adjacent free blocks and reused, and a free block that reaches
  * the top of the heap lowers the bump pointer. Allocations honor the requested
  * alignment. The heap starts at the module's exported {@code __heap_base} and grows
  * upward, growing linear memory through the {@link ExecutionContext} as needed, but never past the
- * per-instance {@link MemoryBudget} — which it shares with the channel buffers, because the
- * configured cap is per instance and covers everything the instance holds.
+ * per-instance {@link MemoryBudget} — which it shares with every other task's heap and with the
+ * channel buffers, because the configured cap is per instance, not per allocator.
  *
  * <p>The guest always supplies {@code old_size} on free/realloc, so blocks carry no
- * header — the free list is the only bookkeeping.
+ * header — the free list is the only bookkeeping, and {@link #copy()} duplicates it
+ * alongside the memory when a task forks.
  *
  * <p>Not thread-safe: one animation instance runs one task at a time, so no
  * synchronization is needed.
@@ -53,16 +49,29 @@ public final class HostAllocator {
         this(heapBase, new MemoryBudget(byteCap));
     }
 
+    private HostAllocator(HostAllocator other) {
+        this.heapBase = other.heapBase;
+        this.budget = other.budget;
+        this.top = other.top;
+        this.free.putAll(other.free);
+        // The child's memory is a real second copy, so its heap is charged again.
+        budget.reserve(allocatedHighWater(), "a forked task's heap copy");
+    }
+
     /**
-     * Frees a block the host itself allocated (a task's stack region), with the same
-     * bookkeeping a guest {@code realloc(ptr, size, _, 0)} would do. Separate from
-     * {@link #realloc} only because the host has no {@link ExecutionContext} to hand it and
-     * needs none: freeing never touches linear memory.
+     * A deep copy of the allocator bookkeeping, for a forking task's memory copy.
+     *
+     * @throws MemoryCapExceededException if copying the heap would exceed the instance budget
      */
-    public void free(int ptr, int size) {
-        if (ptr != 0) {
-            freeBlock(ptr, size);
-        }
+    public HostAllocator copy() {
+        return new HostAllocator(this);
+    }
+
+    /** Returns this heap's whole charge to the budget (its task ended). */
+    public void releaseAll() {
+        budget.release(allocatedHighWater());
+        top = heapBase;
+        free.clear();
     }
 
     /**

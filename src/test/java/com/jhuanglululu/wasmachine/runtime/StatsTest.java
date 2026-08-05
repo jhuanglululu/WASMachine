@@ -129,7 +129,7 @@ class StatsTest {
                 "the heap should be charged while held, was " + held.memoryUsedBytes());
         assertEquals(1 << 20, held.memoryCapBytes());
         assertEquals(1, held.liveTasks());
-        assertEquals(0, held.totalSpawns());
+        assertEquals(0, held.totalForks());
 
         assertInstanceOf(TickResult.Finished.class, inst.tick(1, BUDGET));
         assertEquals(0, inst.stats().memoryUsedBytes(), "the free gave every byte back");
