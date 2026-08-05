@@ -12,7 +12,16 @@ import java.util.Objects;
  * <p>Owned state (deep-copied by {@link #copy()}, the primitive a fork builds on):
  * an operand stack ({@code long[]}, raw bits — floats via {@code Float/Double.*Bits}),
  * a frame stack, its own little-endian linear {@code memory}, its own {@code globals},
- * its own tables, and the passive-segment drop bookkeeping.
+ * its own tables, and the passive-segment drop bookkeeping. The one exception is the
+ * {@link SharedRegion}, which a copy takes by reference — that is the entire point of it.
+ *
+ * <h2>Memory routing</h2>
+ * Every load, store and bulk op resolves its address through {@link #region}: below
+ * {@link SharedRegion#SHARED_BASE} is this task's private memory, at or above it the
+ * instance's shared region. One compare, and a range can never span the two, because the
+ * private array ends far below the base — a length that would cross simply runs off the end
+ * of whichever region it started in and traps. {@code memory.grow}/{@code memory.size} are
+ * private-only: the shared region grows solely through {@code SharedRegion.allocate}.
  *
  * <h2>Mid-host-call resume protocol</h2>
  * When a {@link HostFunction} calls {@link #suspend}, it throws {@link SuspendSignal};
@@ -81,6 +90,12 @@ public final class ExecutionContext {
     private int memPages;
     private int memMaxPages;
 
+    // The instance's shared static region: shared by reference with every forked copy, so it
+    // is the one piece of addressable state a fork does not duplicate.
+    private SharedRegion shared = SharedRegion.NONE;
+    // Where the last region() call landed inside the array it returned.
+    private int regionOffset;
+
     private long[] globals = new long[0];
 
     private int[][] tables = new int[0][];
@@ -108,7 +123,7 @@ public final class ExecutionContext {
         return status;
     }
 
-    /** The linear memory size in bytes. */
+    /** The <em>private</em> linear memory size in bytes (the shared region is not part of it). */
     public int memorySize() {
         return memPages * PAGE;
     }
@@ -118,36 +133,61 @@ public final class ExecutionContext {
         return memPages;
     }
 
+    /**
+     * Attaches the instance's shared static region. Called once, on the context of task 0;
+     * every forked context inherits the same region object through {@link #copy()}.
+     */
+    public void attachSharedRegion(SharedRegion region) {
+        this.shared = Objects.requireNonNull(region);
+    }
+
     public byte loadByte(int addr) {
-        return memory[Objects.checkIndex(addr, memory.length)];
+        byte[] m = hostRegion(addr, 1);
+        return m[regionOffset];
     }
 
     public void storeByte(int addr, byte value) {
-        memory[Objects.checkIndex(addr, memory.length)] = value;
+        byte[] m = hostRegion(addr, 1);
+        m[regionOffset] = value;
     }
 
-    /** Reads a little-endian 32-bit value from linear memory. */
+    /** Reads a little-endian 32-bit value from guest memory (private or shared). */
     public int loadI32(int addr) {
-        Objects.checkFromIndexSize(addr, 4, memory.length);
-        return readI32(memory, addr);
+        byte[] m = hostRegion(addr, 4);
+        return readI32(m, regionOffset);
     }
 
-    /** Writes a little-endian 32-bit value to linear memory. */
+    /** Writes a little-endian 32-bit value to guest memory (private or shared). */
     public void storeI32(int addr, int value) {
-        Objects.checkFromIndexSize(addr, 4, memory.length);
-        writeI32(memory, addr, value);
+        byte[] m = hostRegion(addr, 4);
+        writeI32(m, regionOffset, value);
     }
 
-    /** Copies {@code length} bytes of linear memory starting at {@code addr}. */
+    /** Copies {@code length} bytes of guest memory starting at {@code addr}. */
     public byte[] readBytes(int addr, int length) {
-        Objects.checkFromIndexSize(addr, length, memory.length);
-        return Arrays.copyOfRange(memory, addr, addr + length);
+        byte[] m = hostRegion(addr, length);
+        int off = regionOffset;
+        return Arrays.copyOfRange(m, off, off + length);
     }
 
-    /** Writes {@code src} into linear memory at {@code addr} (bounds-checked). */
+    /** Writes {@code src} into guest memory at {@code addr} (bounds-checked, region-routed). */
     public void writeBytes(int addr, byte[] src) {
-        Objects.checkFromIndexSize(addr, src.length, memory.length);
-        System.arraycopy(src, 0, memory, addr, src.length);
+        byte[] m = hostRegion(addr, src.length);
+        System.arraycopy(src, 0, m, regionOffset, src.length);
+    }
+
+    /**
+     * The host-call form of {@link #region}: same routing (so a host write to a shared address
+     * lands in the shared region), but a failure is a Java exception rather than a guest trap —
+     * a host function that addresses out of bounds is a host bug, not a guest one.
+     */
+    private byte[] hostRegion(int addr, int length) {
+        byte[] m = length < 0 ? null : region(addr & 0xFFFFFFFFL, length);
+        if (m == null) {
+            throw new IndexOutOfBoundsException("guest memory access at 0x"
+                    + Integer.toHexString(addr) + " for " + length + " byte(s) is out of bounds");
+        }
+        return m;
     }
 
     public long readGlobal(int index) {
@@ -186,9 +226,14 @@ public final class ExecutionContext {
 
     // --- deep copy (fork primitive) ---
 
-    /** A fully independent deep copy: stacks, frames, memory, globals, tables. */
+    /**
+     * A fully independent deep copy: stacks, frames, memory, globals, tables. The shared static
+     * region is the deliberate exception — it is taken by reference, so however many times a
+     * task forks there is still exactly one of it.
+     */
     public ExecutionContext copy() {
         ExecutionContext c = new ExecutionContext(instance);
+        c.shared = shared;
         c.stack = stack.clone();
         c.sp = sp;
         c.frames = new Frame[frames.length];
@@ -711,30 +756,30 @@ public final class ExecutionContext {
                     t[i] = v;
                 }
                 // --- loads ---
-                case 0x28 -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushI32(readI32(memory, (int) a)); }
-                case 0x29 -> { long a = ea(f); if (oob(a, 8)) return trapMem(); pushI64(readI64(memory, (int) a)); }
-                case 0x2A -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushF32(Float.intBitsToFloat(readI32(memory, (int) a))); }
-                case 0x2B -> { long a = ea(f); if (oob(a, 8)) return trapMem(); pushI64(readI64(memory, (int) a)); }
-                case 0x2C -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI32(memory[(int) a]); }
-                case 0x2D -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI32(memory[(int) a] & 0xFF); }
-                case 0x2E -> { long a = ea(f); if (oob(a, 2)) return trapMem(); pushI32((short) load16(a)); }
-                case 0x2F -> { long a = ea(f); if (oob(a, 2)) return trapMem(); pushI32(load16(a)); }
-                case 0x30 -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI64(memory[(int) a]); }
-                case 0x31 -> { long a = ea(f); if (oob(a, 1)) return trapMem(); pushI64(memory[(int) a] & 0xFF); }
-                case 0x32 -> { long a = ea(f); if (oob(a, 2)) return trapMem(); pushI64((short) load16(a)); }
-                case 0x33 -> { long a = ea(f); if (oob(a, 2)) return trapMem(); pushI64(load16(a)); }
-                case 0x34 -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushI64(readI32(memory, (int) a)); }
-                case 0x35 -> { long a = ea(f); if (oob(a, 4)) return trapMem(); pushI64(readI32(memory, (int) a) & 0xFFFFFFFFL); }
+                case 0x28 -> { byte[] m = region(ea(f), 4); if (m == null) return trapMem(); pushI32(readI32(m, regionOffset)); }
+                case 0x29 -> { byte[] m = region(ea(f), 8); if (m == null) return trapMem(); pushI64(readI64(m, regionOffset)); }
+                case 0x2A -> { byte[] m = region(ea(f), 4); if (m == null) return trapMem(); pushF32(Float.intBitsToFloat(readI32(m, regionOffset))); }
+                case 0x2B -> { byte[] m = region(ea(f), 8); if (m == null) return trapMem(); pushI64(readI64(m, regionOffset)); }
+                case 0x2C -> { byte[] m = region(ea(f), 1); if (m == null) return trapMem(); pushI32(m[regionOffset]); }
+                case 0x2D -> { byte[] m = region(ea(f), 1); if (m == null) return trapMem(); pushI32(m[regionOffset] & 0xFF); }
+                case 0x2E -> { byte[] m = region(ea(f), 2); if (m == null) return trapMem(); pushI32((short) load16(m, regionOffset)); }
+                case 0x2F -> { byte[] m = region(ea(f), 2); if (m == null) return trapMem(); pushI32(load16(m, regionOffset)); }
+                case 0x30 -> { byte[] m = region(ea(f), 1); if (m == null) return trapMem(); pushI64(m[regionOffset]); }
+                case 0x31 -> { byte[] m = region(ea(f), 1); if (m == null) return trapMem(); pushI64(m[regionOffset] & 0xFF); }
+                case 0x32 -> { byte[] m = region(ea(f), 2); if (m == null) return trapMem(); pushI64((short) load16(m, regionOffset)); }
+                case 0x33 -> { byte[] m = region(ea(f), 2); if (m == null) return trapMem(); pushI64(load16(m, regionOffset)); }
+                case 0x34 -> { byte[] m = region(ea(f), 4); if (m == null) return trapMem(); pushI64(readI32(m, regionOffset)); }
+                case 0x35 -> { byte[] m = region(ea(f), 4); if (m == null) return trapMem(); pushI64(readI32(m, regionOffset) & 0xFFFFFFFFL); }
                 // --- stores ---
-                case 0x36 -> { int v = popI32(); long a = ea(f); if (oob(a, 4)) return trapMem(); writeI32(memory, (int) a, v); }
-                case 0x37 -> { long v = popI64(); long a = ea(f); if (oob(a, 8)) return trapMem(); writeI64(memory, (int) a, v); }
-                case 0x38 -> { int v = popI32(); long a = ea(f); if (oob(a, 4)) return trapMem(); writeI32(memory, (int) a, v); } // f32.store (raw bits)
-                case 0x39 -> { long v = popI64(); long a = ea(f); if (oob(a, 8)) return trapMem(); writeI64(memory, (int) a, v); } // f64.store (raw bits)
-                case 0x3A -> { int v = popI32(); long a = ea(f); if (oob(a, 1)) return trapMem(); memory[(int) a] = (byte) v; }
-                case 0x3B -> { int v = popI32(); long a = ea(f); if (oob(a, 2)) return trapMem(); store16(a, v); }
-                case 0x3C -> { long v = popI64(); long a = ea(f); if (oob(a, 1)) return trapMem(); memory[(int) a] = (byte) v; }
-                case 0x3D -> { long v = popI64(); long a = ea(f); if (oob(a, 2)) return trapMem(); store16(a, (int) v); }
-                case 0x3E -> { long v = popI64(); long a = ea(f); if (oob(a, 4)) return trapMem(); writeI32(memory, (int) a, (int) v); }
+                case 0x36 -> { int v = popI32(); byte[] m = region(ea(f), 4); if (m == null) return trapMem(); writeI32(m, regionOffset, v); }
+                case 0x37 -> { long v = popI64(); byte[] m = region(ea(f), 8); if (m == null) return trapMem(); writeI64(m, regionOffset, v); }
+                case 0x38 -> { int v = popI32(); byte[] m = region(ea(f), 4); if (m == null) return trapMem(); writeI32(m, regionOffset, v); } // f32.store (raw bits)
+                case 0x39 -> { long v = popI64(); byte[] m = region(ea(f), 8); if (m == null) return trapMem(); writeI64(m, regionOffset, v); } // f64.store (raw bits)
+                case 0x3A -> { int v = popI32(); byte[] m = region(ea(f), 1); if (m == null) return trapMem(); m[regionOffset] = (byte) v; }
+                case 0x3B -> { int v = popI32(); byte[] m = region(ea(f), 2); if (m == null) return trapMem(); store16(m, regionOffset, v); }
+                case 0x3C -> { long v = popI64(); byte[] m = region(ea(f), 1); if (m == null) return trapMem(); m[regionOffset] = (byte) v; }
+                case 0x3D -> { long v = popI64(); byte[] m = region(ea(f), 2); if (m == null) return trapMem(); store16(m, regionOffset, (int) v); }
+                case 0x3E -> { long v = popI64(); byte[] m = region(ea(f), 4); if (m == null) return trapMem(); writeI32(m, regionOffset, (int) v); }
                 case 0x3F -> { readVarU32(f); pushI32(memPages); }   // memory.size
                 case 0x40 -> {                                       // memory.grow
                     readVarU32(f);
@@ -943,20 +988,39 @@ public final class ExecutionContext {
         return (popI32() & 0xFFFFFFFFL) + off;
     }
 
-    /** True if [addr, addr+size) is out of bounds of linear memory. */
-    private boolean oob(long addr, int size) {
-        return addr + size > (long) memPages * PAGE;
+    /**
+     * Routes {@code [addr, addr+size)} to the byte array backing it, leaving the offset within
+     * that array in {@link #regionOffset}; {@code null} means out of bounds (the caller traps).
+     *
+     * <p>One compare on the hot path: below {@link SharedRegion#SHARED_BASE} is this task's
+     * private memory, at or above it the instance's shared region. A range can never straddle
+     * the two — private memory ends far below the base — so a bulk op that would cross the
+     * boundary just runs off the end of the region it started in and traps, which is exactly
+     * the rule the shared region needs.
+     */
+    private byte[] region(long addr, long size) {
+        if (addr < SharedRegion.SHARED_BASE) {
+            if (addr + size > (long) memPages * PAGE) {
+                return null;
+            }
+            regionOffset = (int) addr;
+            return memory;
+        }
+        long off = addr - SharedRegion.SHARED_BASE;
+        if (off + size > shared.size()) {
+            return null;
+        }
+        regionOffset = (int) off;
+        return shared.bytes();
     }
 
-    private int load16(long a) {
-        int i = (int) a;
-        return (memory[i] & 0xFF) | ((memory[i + 1] & 0xFF) << 8);
+    private static int load16(byte[] m, int a) {
+        return (m[a] & 0xFF) | ((m[a + 1] & 0xFF) << 8);
     }
 
-    private void store16(long a, int v) {
-        int i = (int) a;
-        memory[i] = (byte) v;
-        memory[i + 1] = (byte) (v >>> 8);
+    private static void store16(byte[] m, int a, int v) {
+        m[a] = (byte) v;
+        m[a + 1] = (byte) (v >>> 8);
     }
 
     private ExecResult trapMem() {
@@ -1123,10 +1187,11 @@ public final class ExecutionContext {
                 long src = popI32() & 0xFFFFFFFFL;
                 long dst = popI32() & 0xFFFFFFFFL;
                 byte[] seg = dataDropped[dataIdx] ? EMPTY : instance.dataSegment(dataIdx);
-                if (src + len > seg.length || dst + len > (long) memPages * PAGE) {
+                byte[] d = region(dst, len);
+                if (src + len > seg.length || d == null) {
                     return trapMem();
                 }
-                System.arraycopy(seg, (int) src, memory, (int) dst, (int) len);
+                System.arraycopy(seg, (int) src, d, regionOffset, (int) len);
             }
             case 9 -> dataDropped[readVarU32(f)] = true; // data.drop
             case 10 -> { // memory.copy
@@ -1139,11 +1204,18 @@ public final class ExecutionContext {
                 dropSlots(1);
                 long src = popI32() & 0xFFFFFFFFL;
                 long dst = popI32() & 0xFFFFFFFFL;
-                long size = (long) memPages * PAGE;
-                if (src + len > size || dst + len > size) {
+                // Each end is routed on its own, so private->shared and shared->private copies
+                // both work; what neither end may do is straddle the boundary.
+                byte[] s = region(src, len);
+                if (s == null) {
                     return trapMem();
                 }
-                System.arraycopy(memory, (int) src, memory, (int) dst, (int) len);
+                int srcOff = regionOffset;
+                byte[] d = region(dst, len);
+                if (d == null) {
+                    return trapMem();
+                }
+                System.arraycopy(s, srcOff, d, regionOffset, (int) len);
             }
             case 11 -> { // memory.fill
                 readVarU32(f);
@@ -1154,10 +1226,11 @@ public final class ExecutionContext {
                 dropSlots(1);
                 byte val = (byte) popI32();
                 long dst = popI32() & 0xFFFFFFFFL;
-                if (dst + len > (long) memPages * PAGE) {
+                byte[] d = region(dst, len);
+                if (d == null) {
                     return trapMem();
                 }
-                Arrays.fill(memory, (int) dst, (int) (dst + len), val);
+                Arrays.fill(d, regionOffset, (int) (regionOffset + len), val);
             }
             case 12 -> { // table.init elemidx tableidx
                 int elemIdx = readVarU32(f);

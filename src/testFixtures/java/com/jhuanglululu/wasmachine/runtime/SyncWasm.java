@@ -5,8 +5,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Hand-rolled WebAssembly modules for the engine imports — tasks, sync, random and the math
- * kernel. Like {@link RuntimeWasm} it writes section framing by hand, so the tests exercise
+ * Hand-rolled WebAssembly modules for the engine imports — tasks, sync, random, environ, the
+ * shared static region and the math kernel. Like {@link RuntimeWasm} it writes section framing by hand, so the tests exercise
  * the real interpreter and the real host-import path rather than a stand-in for them.
  *
  * <p>Every module has the same shape: one import table (indices are the {@code *} constants
@@ -63,9 +63,13 @@ public final class SyncWasm {
     public static final int ACOS = 34;
     public static final int ATAN2 = 35;
     public static final int FORMAT_F64 = 36;
+    // The shared static region and environ (guest-abi.md).
+    public static final int SHARED_ALLOC = 37;
+    public static final int ENVIRON_LEN = 38;
+    public static final int ENVIRON_READ = 39;
 
     /** Where a {@link Surface}'s imports start: the engine's own end at this index. */
-    public static final int ENGINE_IMPORT_COUNT = 37;
+    public static final int ENGINE_IMPORT_COUNT = 40;
 
     private static final int ENGINE_TYPE_COUNT = 13;
 
@@ -119,6 +123,56 @@ public final class SyncWasm {
 
         public P drop() {
             return raw(0x1A);
+        }
+
+        /** {@code i32.store} of the value on top of the stack, at the address below it. */
+        public P storeTop() {
+            return raw(0x36, 0x02, 0x00);
+        }
+
+        /** {@code i32.store} of the constant {@code value} at the address on top of the stack. */
+        public P storeConst(int value) {
+            return i32(value).storeTop();
+        }
+
+        /** {@code i32.load} from the address on top of the stack. */
+        public P loadTop() {
+            return raw(0x28, 0x02, 0x00);
+        }
+
+        /** {@code i32.load} from the constant address {@code addr}. */
+        public P load(int addr) {
+            return i32(addr).loadTop();
+        }
+
+        /** {@code memory.size} in pages. */
+        public P memorySize() {
+            return raw(0x3F, 0x00);
+        }
+
+        /** {@code memory.grow} by the page count on top of the stack. */
+        public P memoryGrow() {
+            return raw(0x40, 0x00);
+        }
+
+        /** {@code memory.copy} of {@code len} bytes from {@code src} to {@code dst}. */
+        public P memoryCopy(P dst, P src, int len) {
+            return append(dst).append(src).i32(len).raw(0xFC, 0x0A, 0x00, 0x00);
+        }
+
+        /** {@code memory.fill} of {@code len} bytes of {@code value} at {@code dst}. */
+        public P memoryFill(P dst, int value, int len) {
+            return append(dst).i32(value).i32(len).raw(0xFC, 0x0B, 0x00);
+        }
+
+        /** {@code i32.add} */
+        public P add() {
+            return raw(0x6A);
+        }
+
+        /** {@code i32.and} */
+        public P and() {
+            return raw(0x71);
         }
 
         /** Logs the {@code index}-th letter of the alphabet. */
@@ -329,6 +383,9 @@ public final class SyncWasm {
         imp(imports, "acos", 10);
         imp(imports, "atan2", 11);
         imp(imports, "format_f64", 12);
+        imp(imports, "shared_alloc", 6);
+        imp(imports, "environ_len", 1);
+        imp(imports, "environ_read", 4);
         if (surface != null) {
             for (int i = 0; i < surface.names.size(); i++) {
                 imports.name(surface.module).name(surface.names.get(i))

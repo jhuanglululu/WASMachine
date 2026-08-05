@@ -7,7 +7,10 @@ import com.jhuanglululu.wasm.ExternalKind;
 import com.jhuanglululu.wasm.HostFunction;
 import com.jhuanglululu.wasm.Instance;
 import com.jhuanglululu.wasm.Module;
+import com.jhuanglululu.wasm.SharedRegion;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -19,11 +22,11 @@ import java.util.concurrent.ThreadLocalRandom;
 /**
  * One running guest: it owns the WASM {@link Instance}, the cooperative tasks that run on it
  * (each an {@link ExecutionContext} with its own memory + {@link HostAllocator}, a wake
- * condition, and a spawn-order index), the {@link SyncTable}, the shared {@link MemoryBudget}
- * and the two random streams. It implements every engine-owned ABI import (realloc, fork, join,
- * kill, exit, sleep, log, fail, sync, random and the {@link MathKernel}), registers the
- * embedder's own import modules next to them, and drives execution one game tick at a time via
- * {@link #tick}.
+ * condition, and a spawn-order index), the one {@link SharedRegion} every task addresses, the
+ * {@link SyncTable}, the shared {@link MemoryBudget} and the two random streams. It implements
+ * every engine-owned ABI import (realloc, shared_alloc, fork, join, kill, exit, sleep, log,
+ * fail, environ, sync, random and the {@link MathKernel}), registers the embedder's own import
+ * modules next to them, and drives execution one game tick at a time via {@link #tick}.
  *
  * <p><b>Scheduling.</b> Each tick, every due task runs (to its next blocking point) in
  * <em>spawn order</em>, sharing one instruction budget. A task blocks at {@code sleep}
@@ -44,6 +47,11 @@ import java.util.concurrent.ThreadLocalRandom;
  *   <li><b>Fork ids.</b> {@code fork} returns the child's task id in the parent and
  *       {@code 0} in the child (Linux semantics). The child is a deep copy of the parent
  *       taken at the fork suspension, resumed with {@code 0}.</li>
+ *   <li><b>One shared static region.</b> The fork copies everything except the
+ *       {@link SharedRegion}: addresses at or above {@link SharedRegion#SHARED_BASE} route to
+ *       a single instance-wide buffer that {@code shared_alloc} bump-allocates and nothing
+ *       ever frees. It charges the {@link MemoryBudget} once, as it grows — never again per
+ *       task, which is the whole reason it exists.</li>
  *   <li><b>Releases land in the next round.</b> A tick runs tasks in rounds: each round
  *       gives every due task one turn in spawn order. A task released by a sync operation
  *       (see {@link SyncTable}) is deliberately held back from the round that released it,
@@ -67,7 +75,7 @@ public final class MachineInstance {
      * older guest simply never imports the new name; semantic changes do. Plugin modules version
      * independently through their own handshake export.
      */
-    public static final int ENGINE_ABI_VERSION = 1;
+    public static final int ENGINE_ABI_VERSION = 2;
 
     /**
      * One load-time handshake: {@code export} is invoked with no arguments and must return an
@@ -84,14 +92,43 @@ public final class MachineInstance {
      * @param entryExport    the exported function task 0 runs (no arguments, one {@code i32})
      * @param abiChecks      the handshake exports validated at construction
      * @param memoryCapBytes the per-instance memory cap: one allowance shared by every task's
-     *                       heap and by the channel buffers (see {@link MemoryBudget})
+     *                       heap, by the shared static region and by the channel buffers
+     *                       (see {@link MemoryBudget})
      * @param instanceSeed   seeds this instance's deterministic random stream
+     * @param environ        the read-only key/value strings the guest reads back through
+     *                       {@code environ_len}/{@code environ_read}. Snapshotted here and
+     *                       immutable for the whole run by design — an embedder that wants a
+     *                       guest to see new values restarts the instance, so a guest never has
+     *                       to reason about environ changing under it
+     * @param sharedRegionCapBytes how far the instance's {@link SharedRegion} may grow. It is a
+     *                       ceiling, not a reservation: the region starts empty and charges the
+     *                       memory cap only for what {@code shared_alloc} actually hands out
      */
     public record Config(String name, String engineModule, String entryExport,
-            List<AbiCheck> abiChecks, long memoryCapBytes, long instanceSeed) {
+            List<AbiCheck> abiChecks, long memoryCapBytes, long instanceSeed,
+            Map<String, String> environ, long sharedRegionCapBytes) {
+
+        /** The default shared-region ceiling: 1 MiB, none of it allocated until asked for. */
+        public static final long DEFAULT_SHARED_REGION_CAP_BYTES = 1 << 20;
 
         public Config {
             abiChecks = List.copyOf(abiChecks);
+            environ = Map.copyOf(environ);
+        }
+
+        /** No environ, {@link #DEFAULT_SHARED_REGION_CAP_BYTES}. */
+        public Config(String name, String engineModule, String entryExport,
+                List<AbiCheck> abiChecks, long memoryCapBytes, long instanceSeed) {
+            this(name, engineModule, entryExport, abiChecks, memoryCapBytes, instanceSeed,
+                    Map.of(), DEFAULT_SHARED_REGION_CAP_BYTES);
+        }
+
+        /** {@link #DEFAULT_SHARED_REGION_CAP_BYTES} for the shared region. */
+        public Config(String name, String engineModule, String entryExport,
+                List<AbiCheck> abiChecks, long memoryCapBytes, long instanceSeed,
+                Map<String, String> environ) {
+            this(name, engineModule, entryExport, abiChecks, memoryCapBytes, instanceSeed,
+                    environ, DEFAULT_SHARED_REGION_CAP_BYTES);
         }
     }
 
@@ -163,7 +200,8 @@ public final class MachineInstance {
      * instance nobody is looking at should carry no measuring cost at all, so anything
      * per-tick lives in a {@link CaptureSummary} instead of a standing counter.
      *
-     * @param memoryUsedBytes bytes charged right now: guest heaps plus channel buffers
+     * @param memoryUsedBytes bytes charged right now: guest heaps, the shared static region and
+     *                        the channel buffers
      * @param memoryCapBytes  the configured per-instance cap
      * @param liveTasks       tasks that have not finished, task 0 included
      * @param totalForks      forks so far — free, since the task-id counter already implies it
@@ -251,8 +289,12 @@ public final class MachineInstance {
 
     private final Instance wasm;
     private final SyncTable sync;
-    // One allowance for every guest heap and every channel buffer in this instance.
+    // One allowance for every guest heap, the shared region and every channel buffer here.
     private final MemoryBudget budget;
+    // The one buffer every task addresses above SHARED_BASE; forks reference it, never copy it.
+    private final SharedRegion sharedRegion;
+    // The environ blob, built once at construction (empty array = no environ).
+    private final byte[] environBlob;
     // The guest-facing deterministic random stream; seed_random restarts it.
     private final SplitMix64 deterministicRandom;
     // In ascending spawn order: task 0 first, forked children appended as created.
@@ -292,6 +334,11 @@ public final class MachineInstance {
         this.logSink = logSink;
         this.deterministicRandom = new SplitMix64(config.instanceSeed());
         this.budget = new MemoryBudget(config.memoryCapBytes());
+        // Charged as it grows, which happens once per shared_alloc and never per fork: the
+        // whole instance holds one region, so the budget sees it exactly once.
+        this.sharedRegion = new SharedRegion(config.sharedRegionCapBytes(),
+                bytes -> budget.reserve(bytes, "the shared static region"));
+        this.environBlob = buildEnvironBlob(config.environ());
         // The scheduling stream is derived from the same seed but never shares state with the
         // guest-facing one, so cosmetic random() calls cannot reshuffle notify_one(Random).
         this.sync = new SyncTable(this::releaseTask,
@@ -299,6 +346,8 @@ public final class MachineInstance {
         this.wasm = new Instance(module, buildImports(pluginImports));
 
         ExecutionContext ctx0 = wasm.instantiate();
+        // Attached to task 0 only: every fork inherits the same region object by reference.
+        ctx0.attachSharedRegion(sharedRegion);
         int heapBase = exportedGlobalI32(module, ctx0, "__heap_base");
 
         Task task0 = new Task(0);
@@ -351,6 +400,53 @@ public final class MachineInstance {
             }
         }
         throw new IllegalArgumentException("module has no exported global \"" + exportName + "\"");
+    }
+
+    /**
+     * Serializes the environ into the wire blob the guest reads: {@code u32} entry count, then
+     * per entry {@code u32 key_len, key, u32 value_len, value}, all little-endian, all strings
+     * UTF-8, entries in ascending order of their raw key bytes. An empty environ serializes to
+     * <em>nothing</em> (not to a zero count), so {@code environ_len() == 0} is the guest's whole
+     * emptiness test and it never has to read to find out.
+     *
+     * <p>Ordering by key bytes rather than by anything locale-aware keeps the blob identical on
+     * every machine, which a determinism-minded guest can rely on.
+     */
+    private static byte[] buildEnvironBlob(Map<String, String> environ) {
+        if (environ.isEmpty()) {
+            return new byte[0];
+        }
+        List<byte[][]> entries = new ArrayList<>(environ.size());
+        for (Map.Entry<String, String> e : environ.entrySet()) {
+            entries.add(new byte[][] {
+                    e.getKey().getBytes(StandardCharsets.UTF_8),
+                    e.getValue().getBytes(StandardCharsets.UTF_8)});
+        }
+        entries.sort((a, b) -> Arrays.compareUnsigned(a[0], b[0]));
+        int size = 4;
+        for (byte[][] e : entries) {
+            size += 4 + e[0].length + 4 + e[1].length;
+        }
+        byte[] blob = new byte[size];
+        int p = putU32(blob, 0, entries.size());
+        for (byte[][] e : entries) {
+            p = putBytes(blob, putU32(blob, p, e[0].length), e[0]);
+            p = putBytes(blob, putU32(blob, p, e[1].length), e[1]);
+        }
+        return blob;
+    }
+
+    private static int putU32(byte[] out, int at, int value) {
+        out[at] = (byte) value;
+        out[at + 1] = (byte) (value >>> 8);
+        out[at + 2] = (byte) (value >>> 16);
+        out[at + 3] = (byte) (value >>> 24);
+        return at + 4;
+    }
+
+    private static int putBytes(byte[] out, int at, byte[] src) {
+        System.arraycopy(src, 0, out, at, src.length);
+        return at + src.length;
     }
 
     /** The instance name. */
@@ -752,6 +848,7 @@ public final class MachineInstance {
         String engine = config.engineModule();
         m.put(engine + ".realloc", (ctx, a) ->
                 currentTask.allocator.realloc(ctx, (int) a[0], (int) a[1], (int) a[2], (int) a[3]));
+        m.put(engine + ".shared_alloc", (ctx, a) -> sharedAlloc((int) a[0], (int) a[1]));
         m.put(engine + ".fork", (ctx, a) -> {
             throw ctx.suspend(FORK);
         });
@@ -775,10 +872,41 @@ public final class MachineInstance {
         m.put(engine + ".fail", (ctx, a) -> {
             throw new GuestAbort(Marshal.readString(ctx, (int) a[0], (int) a[1]));
         });
+        // The len/fill idiom: the guest sizes a buffer, then asks for the bytes. There is no
+        // blocking point between the two calls and the blob never changes during a run, so the
+        // pair cannot race. The destination is routed like any store, so the guest may read the
+        // blob straight into a shared_alloc'd buffer — which is exactly what the SDK does.
+        m.put(engine + ".environ_len", (ctx, a) -> environBlob.length);
+        m.put(engine + ".environ_read", (ctx, a) -> {
+            ctx.writeBytes((int) a[0], environBlob);
+            return 0L;
+        });
         addSyncImports(m, engine);
         addRandomImports(m, engine);
         MathKernel.addImports(m, engine);
         return m;
+    }
+
+    /**
+     * The {@code shared_alloc(size, align)} import: bumps the instance's shared static region
+     * and hands back the guest address, which is at {@link SharedRegion#SHARED_BASE} or above
+     * (so negative read as an {@code i32}). Nothing is ever freed — this is the one-way door
+     * into memory a fork shares instead of copying.
+     *
+     * <p>A request the region cannot hold fails the whole instance with
+     * {@link MemoryCapExceededException}, exactly as a heap allocation past the memory cap does:
+     * there is no allocation failure a guest could handle, and no free to retry after. The
+     * region's own ceiling is checked here; the instance memory cap is checked by the charge the
+     * region makes on the way, and reports itself.
+     */
+    private long sharedAlloc(int size, int align) {
+        int ptr = sharedRegion.allocate(size, align);
+        if (ptr == 0) {
+            throw new MemoryCapExceededException("shared static region cap of "
+                    + sharedRegion.capBytes() + " bytes exceeded: shared_alloc(" + size + ", "
+                    + align + ") on top of " + sharedRegion.size() + " already held");
+        }
+        return ptr;
     }
 
     /** The engine sync imports. Every one of these kills the instance on a bad id or kind. */

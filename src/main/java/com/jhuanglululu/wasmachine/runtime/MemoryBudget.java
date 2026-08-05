@@ -8,7 +8,9 @@ package com.jhuanglululu.wasmachine.runtime;
  *
  * <p>Charging every task's heap rather than capping each separately is the same rule read
  * honestly — a forked task's memory is a real second copy, so an instance's footprint is the sum
- * over its tasks.
+ * over its tasks. The instance's shared static region
+ * ({@link com.jhuanglululu.wasm.SharedRegion}) reads the same rule the other way: there is one
+ * of it however many tasks address it, so it charges the counter once, as it grows.
  *
  * <p>Reservations are all-or-nothing: a refused one throws {@link MemoryCapExceededException} and
  * consumes nothing, so the caller's own bookkeeping stays consistent.
